@@ -306,6 +306,20 @@ function assert(ok: any, msg='assert'){ if(!ok) throw new Error(msg) }
 const dpr = () => Math.max(1, window.devicePixelRatio || 1)
 let gridW = 1, gridH = 1, cellSize = 16
 
+// Define GPUBufferUsage globally for reuse
+const GPUBufferUsage = (navigator as any).gpu?.GPUBufferUsage || {
+  MAP_READ: 0x0001,
+  MAP_WRITE: 0x0002,
+  COPY_SRC: 0x0004,
+  COPY_DST: 0x0008,
+  INDEX: 0x0010,
+  VERTEX: 0x0020,
+  UNIFORM: 0x0040,
+  STORAGE: 0x0080,
+  INDIRECT: 0x0100,
+  QUERY_RESOLVE: 0x0200,
+};
+
 async function init() {
   assert('gpu' in navigator, 'WebGPU not available')
   const adapter = await (navigator as any).gpu.requestAdapter()
@@ -334,6 +348,18 @@ function allocBuffers() {
   const N = cfg.count
   const particleStride = 4*2 + 4*2 + 4 + 4 + 4 + 4 + 4 + 4 + 4*3 + 4 // 4B per scalar
   const bytes = particleStride * N
+  const GPUBufferUsage = (navigator as any).gpu?.GPUBufferUsage || {
+    MAP_READ: 0x0001,
+    MAP_WRITE: 0x0002,
+    COPY_SRC: 0x0004,
+    COPY_DST: 0x0008,
+    INDEX: 0x0010,
+    VERTEX: 0x0020,
+    UNIFORM: 0x0040,
+    STORAGE: 0x0080,
+    INDIRECT: 0x0100,
+    QUERY_RESOLVE: 0x0200,
+  };
   buffers.particles = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
 
   // next pointers for cell linked lists
@@ -528,6 +554,7 @@ function frame(t: number) {
 
   // map readback if we scheduled it
   if ((frameId % readbackDivider) === 0) {
+    const GPUMapMode = (navigator as any).gpu?.GPUMapMode || { READ: 0x0001, WRITE: 0x0002 };
     buffers.countersRead.mapAsync(GPUMapMode.READ).then(()=>{
       const arr = new Uint32Array(buffers.countersRead.getMappedRange())
       const alive = arr[0]; const lastAlive = arr[1]
