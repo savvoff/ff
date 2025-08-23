@@ -3,6 +3,7 @@ import { computed, inject, onBeforeUnmount, onMounted, reactive, ref, shallowRef
 import LabeledNumber from '@/components/LabeledNumber.vue';
 import LabeledRange from '@/components/LabeledRange.vue';
 import Scoreboard from '@/components/Scoreboard.vue';
+import { useLocalStorage } from '@/composables/useLocalStorage';
 
 // ---------- Types ----------
 interface Follower { name: string; avatarUrl?: string }
@@ -20,7 +21,7 @@ const isStylesReady = inject('TAILWIND') as  Ref<boolean | undefined>
 const followers = shallowRef<Follower[]>([])
 const seed = ref(42)
 const arena = reactive({ width: 0, height: 0 })
-const params = reactive({
+const defaultParams = {
   maxFollowers: 200,
   radiusMin: 10,
   radiusMax: 12,
@@ -30,24 +31,27 @@ const params = reactive({
   elasticity: 0.8,
   speed: 1.4,
   endless: false,
-  // NEW: motion & effects
+  // motion & effects
   minSpeed: 300,      // px/s minimal speed
   maxSpeed: 450,      // px/s cap
   jitter: 10,         // px/s^2 random accel
   accelOnHit: 1.18,   // × speed boost on collisions
-  accelOnWall: 1.1,  // × speed boost on wall bounce
+  accelOnWall: 1.1,   // × speed boost on wall bounce
   deathFadeMs: 600,   // fade+shrink duration
   deathShrink: 0.1,
-  // Growth when fewer players remain
+  // growth when fewer players remain
   growthEnabled: true,
   growthMaxScale: 4.5,
   growthExponent: 1,
-  // params:
+  // growth params:
   growthStartSurvivors: 0.4,   // Growth starts when living ≤ 50% of the initial
-  growthFullSurvivors: 0.05, // full growth at ≤ 12.5%
-  growthSmoothSec: 0.9,   // seconds up to ~ 63% rapprochement (exhibit. Smoothing)
-})
+  growthFullSurvivors: 0.05,   // full growth at ≤ 12.5%
+  growthSmoothSec: 0.9,        // seconds up to ~63% rapprochement
+}
 
+// 🔹 Load from localStorage (if exists), else use defaults
+const saved = useLocalStorage('params', defaultParams)
+const params = saved.value ?? reactive(defaultParams)
 const running = ref(true)
 const winner = ref<Particle|null>(null)
 
@@ -365,8 +369,8 @@ function step(dt: number, ctx: CanvasRenderingContext2D) {
 function resize(cvs: HTMLCanvasElement | null) {
   if (!cvs) return
   const rectW = cvs.clientWidth || 1280
-  arena.width = rectW
-  arena.height = Math.round(rectW * 9/16)
+  arena.width = arena.width || rectW
+  arena.height = arena.height || Math.round(rectW * 9/16)
 
   cvs.width  = Math.floor(arena.width  * dpr.value)
   cvs.height = Math.floor(arena.height * dpr.value)
