@@ -89,13 +89,6 @@ let gridW = 0, gridH = 0, cellPx = 24
 let gridHead: Int32Array | null = null        // head index per cell
 let gridPairsCount: Int32Array | null = null  // pairs used per cell (cap)
 let nextInCell: Int32Array | null = null      // linked list: next index per particle
-const NEIGHBOR_OFFSETS: Array<[number, number]> = [
-  [0, 0],  // same cell (we will do i<j)
-  [1, 0],  // right
-  [0, 1],  // down
-  [1, 1],  // down-right
-  [-1, 1], // down-left
-]
 
 // Winner
 let aliveCount = 0

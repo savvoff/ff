@@ -124,8 +124,12 @@ function parseInstagramFollowersHtml(html: string): Row[] {
     const name = (a.textContent || user).trim()
     const profileUrl = `https://www.instagram.com/${user}/`
 
-    // Start with placeholder; later resolve real URL via Worker
-    const avatarUrl = placeholderAvatar(user, opts.size)
+    const workerBase = (opts.workerUrl || '').trim().replace(/\/+$/, '')
+    const avatarUrl = workerBase
+      ? `${workerBase}/image?u=${encodeURIComponent(user)}&size=${opts.size}`
+      // fallback if worker URL is not set yet
+      : `https://unavatar.io/instagram/${encodeURIComponent(user)}.png?size=${opts.size}`
+
     out.push({ name, avatarUrl, profileUrl })
   }
   return out
