@@ -25,9 +25,16 @@ onMounted(() => {
 </script>
 
 <template>
-  <nav class="d-flex">
-    <router-link class="p-4" to="/">Simulate</router-link>
-    <router-link class="p-4" to="/gpu">GPU Simulate</router-link>
+  <nav class="d-flex bg-white">
+    <router-link class="inline-block p-2" to="/">Simulate</router-link>
+    <router-link class="inline-block p-2" to="/gpu">GPU Simulate</router-link>
+    <router-link class="inline-block p-2" to="/parser">Parser</router-link>
   </nav>
   <router-view />
 </template>
+
+<style lang="scss">
+  input[type="number"] { -moz-appearance: textfield; }
+  input[type="number"]::-webkit-outer-spin-button,
+  input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+</style>

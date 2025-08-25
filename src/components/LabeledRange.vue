@@ -8,7 +8,7 @@ const props = defineProps({
   max: { type: Number, default: 1 },
   step: { type: Number, default: 0.01 },
 })
-
+console.log(props.label)
 const emit = defineEmits<{
   (e: 'update:modelValue', value: number): void
 }>()

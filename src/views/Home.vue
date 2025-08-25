@@ -17,7 +17,7 @@ interface Particle {
 }
 
 // ---------- State ----------
-const isStylesReady = inject('TAILWIND') as  Ref<boolean | undefined>
+const isStylesReady = inject('TAILWIND') as Ref<boolean | undefined>
 const followers = shallowRef<Follower[]>([])
 const seed = ref(42)
 const arena = reactive({ width: 0, height: 0 })
@@ -49,7 +49,7 @@ const defaultParams = {
   growthSmoothSec: 0.9,        // seconds up to ~63% rapprochement
 }
 
-// 🔹 Load from localStorage (if exists), else use defaults
+// Load from localStorage (if exists), else use defaults
 const saved = useLocalStorage('params', defaultParams)
 const params = saved.value ?? reactive(defaultParams)
 const running = ref(true)
@@ -207,6 +207,7 @@ function targetGrowthScale(aliveCount: number) {
 }
 let gScaleCurrent = 1
 function updateGrowth(dt:number){
+  if (!params.growthEnabled) return 1
   const alive = particles.value.reduce((s,p)=>s + (p.alive && !p.dying ? 1 : 0), 0)
   const gTarget = targetGrowthScale(alive)
   const tau = Math.max(0.001, params.growthSmoothSec)

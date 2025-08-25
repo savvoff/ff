@@ -1,676 +1,590 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref, reactive, computed, nextTick } from 'vue'
-import LabeledNumber from '@/components/LabeledNumber.vue';
-import LabeledRange from '@/components/LabeledRange.vue';
+// All comments in this code are in English only.
+import { ref, reactive, onMounted, onBeforeUnmount, watch } from 'vue'
+import LabeledRange from '@/components/LabeledRange.vue'
+import LabeledNumber from '@/components/LabeledNumber.vue'
+import { useLocalStorage } from '@/composables/useLocalStorage'
+import demo from '../demo.json';
 
-// Add WebGPU types if missing (for TypeScript)
-type GPUCanvasContext = any;
-type GPUTextureFormat = any;
-type GPUDevice = any;
-const canvasRef = ref<HTMLCanvasElement|null>(null)
-const running = ref(false)
-const seed = ref(42)
-const cfg = reactive({
-  count: 200000,
-  speed: 1.4,
-  minSpeed: 300,
-  maxSpeed: 450,
-  elasticity: 0.8,
-  accelOnHit: 1.18,
-  accelOnWall: 1.10,
-  jitter: 10,
-  radiusMin: 6,
-  radiusMax: 12,
-  baseHp: 400,
-  damageMin: 6,
-  damageMax: 14,
-  deathFadeMs: 600,
-  deathShrink: 0.1,
-  growthEnabled: true,
-  growthMaxScale: 4.5,
-  growthExponent: 1.0,
-  growthStartSurvivors: 0.4,
-  growthFullSurvivors: 0.05,
-  growthSmoothSec: 0.9,
-  enableCollisions: true,
-  endless: false,
-})
-
-const statsText = computed(()=> running.value ? `Running • N=${cfg.count.toLocaleString()}` : 'Paused')
-const winnerIdx = ref(-1)
-
-let device: GPUDevice
-let context: GPUCanvasContext
-let format: GPUTextureFormat
-let pipelines: any = {}
-let bindGroups: any = {}
-let buffers: any = {}
-let animation = 0
-let last = 0
-let frameId = 0
-
-// Canvas helper to avoid null ref usage
-function getCanvas(): HTMLCanvasElement {
-  const c = canvasRef.value as HTMLCanvasElement | null
-  if (!c) { throw new Error('Canvas not mounted yet') }
-  return c
+const defaultParams = {
+  // visuals
+  aliveCount: 200,
+  radiusCss: 6,
+  autoRadius: true,
+  radiusScaleMax: 3.0,
+  radiusScaleExp: 1.0,
+  speedCss: 150,
+  color: '#f3f3ff',
+  bg: '#0b111a',
+  ringColor: '#58b6ff',
+  ringWidthPx: 2,
+  minSpeedCss: 100,
+  maxSpeedCss: 300,
+  hitBoostPct: 5,
+  wallBoostPct: 10,
+  // health
+  hpMax: 200,
+  dmgHitMin: 6,
+  dmgHitMax: 14,
+  // physics
+  collisions: true,
+  cellSizePx: 24,
+  maxPairsPerCell: 128,
+  // labels
+  labelsCount: 64,
+  labelsSmoothMs: 150,
+  labelsThrottleMs: 50,
+  // fps
+  fps: 60,
+  paused: false,
+  // auto tune
+  autoTune: true,
+  // GPU avatars
+  gpuAvatars: true,
+  avatarTilePx: 64,
 }
 
-// ========= WGSL SHADERS =========
-// Storage particle layout
-const wgslCommon = /* wgsl */`
-struct Particle {
-  pos: vec2<f32>,
-  vel: vec2<f32>,
-  r: f32,
-  hp: f32,
-  maxHp: f32,
-  alive: u32,
-  dying: u32,
-  deathLeft: f32,
-  color: vec3<f32>,
-  _pad: f32,
-};
 
-struct SimParams {
-  dt: f32; W: f32; H: f32; speed: f32;
-  minSpeed: f32; maxSpeed: f32; elasticity: f32; accelOnWall: f32;
-  jitter: f32; gScale: f32; cellSize: f32; damageMin: f32;
-  damageMax: f32; accelOnHit: f32; deathFadeSec: f32; time: f32;
-  gridW: u32; gridH: u32; endless: u32; _padU: u32;
-};
+// Load from localStorage (if exists), else use defaults
+const saved = useLocalStorage('params-gpu', defaultParams)
+const ui = saved.value ?? reactive(defaultParams)
 
-struct Counters { alive: atomic<u32>, lastAlive: atomic<u32> };
+const stageRef = ref<HTMLDivElement | null>(null)
+const pointsRef = ref<HTMLCanvasElement | null>(null)
+const labelsRef = ref<HTMLCanvasElement | null>(null)
+let worker: Worker | null = null
+let dpr = 1
+let offscreenTransferred = false
+let ro: ResizeObserver | null = null
 
-@group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
-@group(0) @binding(1) var<uniform> U: SimParams;
-@group(0) @binding(2) var<storage, read_write> cellHead: array<i32>;
-@group(0) @binding(3) var<storage, read_write> nextPtr: array<i32>;
-@group(0) @binding(4) var<storage, read_write> counters: Counters;
+type LabelSlot = { id: number; name: string; x: number; y: number; tx: number; ty: number; hp01: number; vis: number }
+let labelSlots: LabelSlot[] = []
+let rafId: number | null = null
+let lastRAF = performance.now()
+let lastRadiusPx = 8
+let lastAliveCount = ui.aliveCount
 
-fn hash(u: u32) -> f32 {
-  var x = u * 747796405u + 2891336453u;
-  x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
-  x = (x >> 22u) ^ x;
-  return f32(x) / 4294967295.0;
-}
+const boot = reactive({ started: false, counting: false, counter: 0 })
 
-fn clampf(x:f32, a:f32, b:f32) -> f32 { return max(a, min(b, x)); }
-`;
+const rawJsonString = JSON.stringify(demo);
+const usersJson = ref(rawJsonString)
+type User = { name: string; avatarUrl?: string }
+const users = ref<User[]>([])
 
-const csClearGrid = /* wgsl */`${wgslCommon}
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = i32(gid.x);
-  let total = i32(U.gridW) * i32(U.gridH);
-  if (idx < total) { cellHead[idx] = -1; }
-}
-`;
-
-const csIntegrate = /* wgsl */`${wgslCommon}
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  if (i >= arrayLength(&particles)) { return; }
-  var p = particles[i];
-  if (p.alive == 0u && p.dying == 0u) { return; }
-
-  // death anim
-  if (p.dying == 1u) {
-    p.deathLeft -= U.dt;
-    if (p.deathLeft <= 0.0) {
-      p.dying = 0u; p.alive = 0u;
+function parseUsersJSON() {
+  try {
+    const arr = JSON.parse(usersJson.value)
+    if (Array.isArray(arr)) {
+      users.value = arr.filter((x: any) => x && typeof x.name === 'string')
+      buildLabelIndices()
     }
+  } catch {}
+}
+
+// ---- sizing ----
+function fit() {
+  const stage = stageRef.value, p = pointsRef.value, l = labelsRef.value
+  if (!stage || !p) return
+  const rect = stage.getBoundingClientRect()
+  const cssW = Math.max(1, Math.floor(rect.width))
+  const cssH = Math.max(1, Math.floor(rect.height))
+
+  dpr = Math.min(window.devicePixelRatio || 1, 2)
+
+  p.style.width = `${cssW}px`; p.style.height = `${cssH}px`
+  if (l) {
+    l.style.width = `${cssW}px`; l.style.height = `${cssH}px`
+    l.width = Math.floor(cssW * dpr); l.height = Math.floor(cssH * dpr)
   }
-
-  // integrate
-  p.pos += p.vel * (U.dt * U.speed);
-
-  // walls
-  let effR = p.r * U.gScale * (select(1.0, clampf(p.deathLeft / U.deathFadeSec, 0.0, 1.0)*(1.0-U.deathFadeSec)+U.deathFadeSec, p.dying==1u));
-  var r = max(1.0, effR);
-  if (p.pos.x < r) { p.pos.x = r; p.vel.x = -p.vel.x * U.elasticity; p.vel *= vec2<f32>(U.accelOnWall, U.accelOnWall); }
-  if (p.pos.x > U.W - r) { p.pos.x = U.W - r; p.vel.x = -p.vel.x * U.elasticity; p.vel *= vec2<f32>(U.accelOnWall, U.accelOnWall); }
-  if (p.pos.y < r) { p.pos.y = r; p.vel.y = -p.vel.y * U.elasticity; p.vel *= vec2<f32>(U.accelOnWall, U.accelOnWall); }
-  if (p.pos.y > U.H - r) { p.pos.y = U.H - r; p.vel.y = -p.vel.y * U.elasticity; p.vel *= vec2<f32>(U.accelOnWall, U.accelOnWall); }
-
-  // damping + jitter
-  p.vel *= 0.999;
-  let fr = u32(floor(U.time*60.0));
-  let jx = (hash(i ^ (fr*1664525u)) * 2.0 - 1.0) * U.jitter;
-  let jy = (hash((i+12345u) ^ (fr*1013904223u)) * 2.0 - 1.0) * U.jitter;
-  p.vel += vec2<f32>(jx, jy) * U.dt;
-
-  // speed bounds
-  let v = length(p.vel);
-  if (v < U.minSpeed) {
-    if (v < 1e-3) {
-      let ang = hash(i ^ (fr*747796405u)) * 6.28318;
-      p.vel = vec2<f32>(cos(ang), sin(ang)) * U.minSpeed;
-    } else {
-      p.vel *= U.minSpeed / v;
-    }
-  } else if (v > U.maxSpeed) {
-    p.vel *= U.maxSpeed / v;
-  }
-
-  // alive counter (for CPU to fetch)
-  if (p.alive == 1u && p.dying == 0u) {
-    atomicAdd(&counters.alive, 1u);
-    atomicStore(&counters.lastAlive, i);
-  }
-
-  particles[i] = p;
-}
-`;
-
-const csBuildGrid = /* wgsl */`${wgslCommon}
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = i32(gid.x);
-  if (u32(i) >= arrayLength(&particles)) { return; }
-  let p = particles[u32(i)];
-  if (p.alive == 0u || p.dying == 1u) { nextPtr[i] = -1; return; }
-  let cs = U.cellSize;
-  let gx = clamp(i32(p.pos.x / cs), 0, i32(U.gridW)-1);
-  let gy = clamp(i32(p.pos.y / cs), 0, i32(U.gridH)-1);
-  let idx = gy * i32(U.gridW) + gx;
-  // push front (lock-free): next[i] = atomicExchange(head[idx], i)
-  nextPtr[i] = atomicExchange(&cellHead[idx], i);
-}
-`;
-
-const csCollide = /* wgsl */`${wgslCommon}
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = i32(gid.x);
-  if (u32(i) >= arrayLength(&particles)) { return; }
-  var self = particles[u32(i)];
-  if (self.alive == 0u) { return; }
-
-  // Skip resolving if dying: just fade out
-  let gW = i32(U.gridW); let gH = i32(U.gridH); let cs = U.cellSize;
-  let cx = clamp(i32(self.pos.x / cs), 0, gW-1);
-  let cy = clamp(i32(self.pos.y / cs), 0, gH-1);
-
-  // Effective radius
-  let dyingScale = select(1.0, clampf(self.deathLeft / U.deathFadeSec, 0.0, 1.0) * (1.0-U.deathFadeSec) + U.deathFadeSec, self.dying==1u);
-  let aR = self.r * U.gScale * dyingScale;
-
-  for (var gy = cy-1; gy <= cy+1; gy++) {
-    if (gy < 0 || gy >= gH) { continue; }
-    for (var gx = cx-1; gx <= cx+1; gx++) {
-      if (gx < 0 || gx >= gW) { continue; }
-      var j = cellHead[gy * gW + gx];
-      loop {
-        if (j < 0) { break; }
-        if (j != i) {
-          let other = particles[u32(j)];
-          if (other.alive == 1u && other.dying == 0u) {
-            let dx = other.pos.x - self.pos.x;
-            let dy = other.pos.y - self.pos.y;
-            let rsum = aR + other.r * U.gScale;
-            let d2 = dx*dx + dy*dy;
-            if (d2 <= rsum*rsum) {
-              let d = sqrt(max(d2, 1e-6));
-              let nx = dx / d; let ny = dy / d;
-              let overlap = rsum - d;
-              // Move ONLY self (no races)
-              let corr = overlap * 0.8; // a bit more to reduce sinking
-              self.pos.x -= nx * corr; self.pos.y -= ny * corr;
-              // Elastic reflect of self against other
-              let rvx = other.vel.x - self.vel.x;
-              let rvy = other.vel.y - self.vel.y;
-              let vn = rvx*nx + rvy*ny;
-              if (vn < 0.0) {
-                let imp = -(1.0 + U.elasticity) * vn;
-                self.vel.x -= imp * nx; self.vel.y -= imp * ny;
-                self.vel *= vec2<f32>(U.accelOnHit, U.accelOnHit);
-              }
-              // Damage to self (symmetric)
-              let fr = u32(floor(U.time*60.0));
-              let rnd = hash(u32(i) ^ (fr * 69069u));
-              let dmg = mix(U.damageMin, U.damageMax, rnd);
-              if (self.hp > 0.0) { self.hp -= dmg; }
-              if (self.hp <= 0.0 && self.dying == 0u) {
-                if (U.endless == 1u) {
-                  // respawn random
-                  let rx = hash(u32(i) ^ 1234567u) * U.W;
-                  let ry = hash(u32(i) ^ 7654321u) * U.H;
-                  self.pos = vec2<f32>(rx, ry);
-                  self.vel = vec2<f32>( (rnd*2.0-1.0)*80.0*U.speed, ((1.0-rnd)*2.0-1.0)*80.0*U.speed );
-                  self.hp = self.maxHp; self.dying = 0u; self.alive = 1u; self.deathLeft = 0.0;
-                } else {
-                  self.dying = 1u; self.deathLeft = U.deathFadeSec;
-                }
-              }
-            }
-          }
-        }
-        j = nextPtr[j];
-      }
-    }
-  }
-
-  // enforce speed bounds again after collisions
-  let v = length(self.vel);
-  if (v < U.minSpeed) { self.vel *= U.minSpeed / max(v, 1e-6); }
-  if (v > U.maxSpeed) { self.vel *= U.maxSpeed / v; }
-
-  particles[u32(i)] = self;
-}
-`;
-
-const vsQuad = /* wgsl */`${wgslCommon}
-struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec3<f32>, @location(2) alpha: f32 };
-@vertex
-fn main(@builtin(instance_index) inst: u32, @builtin(vertex_index) vid: u32) -> VSOut {
-  let p = particles[inst];
-  var scale = U.gScale;
-  if (p.dying == 1u) {
-    let t = clampf(p.deathLeft / U.deathFadeSec, 0.0, 1.0);
-    scale *= mix(U.deathShrink, 1.0, t);
-  }
-  let r = max(1.0, p.r * scale);
-
-  var corner = vec2<f32>(0.0, 0.0);
-  if (vid == 0u) { corner = vec2<f32>(-r, -r); }
-  if (vid == 1u) { corner = vec2<f32>( r, -r); }
-  if (vid == 2u) { corner = vec2<f32>(-r,  r); }
-  if (vid == 3u) { corner = vec2<f32>( r,  r); }
-  let xy = (p.pos + corner);
-  let ndc = vec2<f32>( (xy.x / U.W) * 2.0 - 1.0, 1.0 - (xy.y / U.H) * 2.0 );
-  var o: VSOut;
-  o.pos = vec4<f32>(ndc, 0.0, 1.0);
-  o.uv = corner / (r*2.0) + 0.5; // 0..1
-  var a = 1.0;
-  if (p.dying == 1u) { a = clampf(p.deathLeft / U.deathFadeSec, 0.0, 1.0); }
-  o.color = p.color; o.alpha = a;
-  return o;
-}
-`;
-
-const fsCircle = /* wgsl */`
-@fragment
-fn main(@location(0) uv: vec2<f32>, @location(1) color: vec3<f32>, @location(2) a: f32) -> @location(0) vec4<f32> {
-  let d = distance(uv, vec2<f32>(0.5,0.5));
-  if (d > 0.5) { discard; }
-  let shade = 0.7 + (0.3 * (1.0 - d*2.0));
-  return vec4<f32>(color * shade, a);
-}
-`;
-
-// ========= JS/TS SIDE =========
-function assert(ok: any, msg='assert'){ if(!ok) throw new Error(msg) }
-
-const dpr = () => Math.max(1, window.devicePixelRatio || 1)
-let gridW = 1, gridH = 1, cellSize = 16
-
-// Define GPUBufferUsage globally for reuse
-const GPUBufferUsage = (navigator as any).gpu?.GPUBufferUsage || {
-  MAP_READ: 0x0001,
-  MAP_WRITE: 0x0002,
-  COPY_SRC: 0x0004,
-  COPY_DST: 0x0008,
-  INDEX: 0x0010,
-  VERTEX: 0x0020,
-  UNIFORM: 0x0040,
-  STORAGE: 0x0080,
-  INDIRECT: 0x0100,
-  QUERY_RESOLVE: 0x0200,
-};
-
-async function init() {
-  assert('gpu' in navigator, 'WebGPU not available')
-  const adapter = await (navigator as any).gpu.requestAdapter()
-  assert(adapter, 'No GPU adapter')
-  device = await adapter.requestDevice()
-
-  const canvas = getCanvas()
-  context = canvas.getContext('webgpu') as GPUCanvasContext
-  format = (navigator as any).gpu.getPreferredCanvasFormat()
-  context.configure({ device, format, alphaMode: 'premultiplied' })
-
-  resize()
-  createPipelines()
-  allocBuffers()
-  build()
+  const devW = Math.floor(cssW * dpr), devH = Math.floor(cssH * dpr)
+  if (!offscreenTransferred) { p.width = devW; p.height = devH }
+  worker?.postMessage({ type: 'resize', width: devW, height: devH, dpr })
 }
 
-function resize() {
-  const canvas = getCanvas()
-  const W = (canvas.clientWidth || 1280), H = Math.round(W * 9/16)
-  canvas.width = Math.floor(W * dpr())
-  canvas.height = Math.floor(H * dpr())
+// ---- config push ----
+function hexToRgbFloats(hex: string): [number, number, number] {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex.trim())
+  const r = m ? parseInt(m[1], 16) : 255
+  const g = m ? parseInt(m[2], 16) : 255
+  const b = m ? parseInt(m[3], 16) : 255
+  return [r / 255, g / 255, b / 255]
 }
-
-function allocBuffers() {
-  const N = cfg.count
-  const particleStride = 4*2 + 4*2 + 4 + 4 + 4 + 4 + 4 + 4 + 4*3 + 4 // 4B per scalar
-  const bytes = particleStride * N
-  const GPUBufferUsage = (navigator as any).gpu?.GPUBufferUsage || {
-    MAP_READ: 0x0001,
-    MAP_WRITE: 0x0002,
-    COPY_SRC: 0x0004,
-    COPY_DST: 0x0008,
-    INDEX: 0x0010,
-    VERTEX: 0x0020,
-    UNIFORM: 0x0040,
-    STORAGE: 0x0080,
-    INDIRECT: 0x0100,
-    QUERY_RESOLVE: 0x0200,
-  };
-  buffers.particles = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
-
-  // next pointers for cell linked lists
-  buffers.nextPtr = device.createBuffer({ size: N*4, usage: GPUBufferUsage.STORAGE })
-
-  // grid heads (will be resized in build())
-  const W = getCanvas().width, H = getCanvas().height
-  cellSize = Math.max(8, Math.ceil(2 * cfg.radiusMax * 1.2))
-  gridW = Math.max(1, Math.ceil(W / cellSize))
-  gridH = Math.max(1, Math.ceil(H / cellSize))
-  buffers.cellHead = device.createBuffer({ size: gridW*gridH*4, usage: GPUBufferUsage.STORAGE })
-
-  // uniforms
-  buffers.uniforms = device.createBuffer({ size: 4*4*5, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }) // 20 floats
-
-  // counters (alive, lastAlive)
-  buffers.counters = device.createBuffer({ size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
-  buffers.countersRead = device.createBuffer({ size: 8, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
-}
-
-function createPipelines() {
-  pipelines.clearGrid = device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: csClearGrid }), entryPoint: 'main' } })
-  pipelines.integrate = device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: csIntegrate }), entryPoint: 'main' } })
-  pipelines.buildGrid = device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: csBuildGrid }), entryPoint: 'main' } })
-  pipelines.collide = device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: csCollide }), entryPoint: 'main' } })
-  pipelines.render = device.createRenderPipeline({
-    layout: 'auto',
-    vertex: { module: device.createShaderModule({ code: vsQuad }), entryPoint: 'main' },
-    fragment: { module: device.createShaderModule({ code: fsCircle }), entryPoint: 'main', targets: [{ format, blend: { color: {srcFactor:'src-alpha', dstFactor:'one-minus-src-alpha', operation:'add'}, alpha:{srcFactor:'one', dstFactor:'one-minus-src-alpha', operation:'add'} } }] },
-    primitive: { topology: 'triangle-strip' },
+function pushConfig() {
+  if (!worker) return
+  worker.postMessage({
+    type: 'config',
+    radiusCss: ui.radiusCss,
+    autoRadius: ui.autoRadius,
+    radiusScaleMax: ui.radiusScaleMax,
+    radiusScaleExp: ui.radiusScaleExp,
+    speedCss: ui.speedCss,
+    color: hexToRgbFloats(ui.color),
+    bg: hexToRgbFloats(ui.bg),
+    ringColor: hexToRgbFloats(ui.ringColor),
+    ringWidthPx: ui.ringWidthPx,
+    minSpeedCss: ui.minSpeedCss,
+    maxSpeedCss: ui.maxSpeedCss,
+    hitBoostMul: 1 + ui.hitBoostPct / 100,
+    wallBoostMul: 1 + ui.wallBoostPct / 100,
+    collisions: ui.collisions,
+    cellSizePx: ui.cellSizePx,
+    maxPairsPerCell: ui.maxPairsPerCell,
+    hpMax: ui.hpMax,
+    dmgHitMin: ui.dmgHitMin,
+    dmgHitMax: ui.dmgHitMax,
   })
+  worker.postMessage({ type: 'fps', maxFps: ui.fps })
 }
 
-function build() {
-  // init particle data on CPU
-  const N = cfg.count
-  const f32 = new Float32Array((4*2 + 4*2 + 1 + 1 + 1 + 1 + 1 + 1 + 3 + 1) * N) // same stride/4
-  const u32 = new Uint32Array(f32.buffer)
-  const R = (min:number,max:number)=>min + (max-min)*mulberry32(seed.value)()
-  const rand = mulberry32(seed.value)
-  const W = getCanvas().width, H = getCanvas().height
-  for (let i=0;i<N;i++) {
-    let off = i* ( (f32.length)/N )
-    let x = rand()*W, y = rand()*H
-    let r = R(cfg.radiusMin, cfg.radiusMax)
-    let vx = (rand()*2-1) * 80 * cfg.speed
-    let vy = (rand()*2-1) * 80 * cfg.speed
-    f32[off+0] = x; f32[off+1] = y; // pos
-    f32[off+2] = vx; f32[off+3] = vy; // vel
-    f32[off+4] = r; // r
-    f32[off+5] = cfg.baseHp; // hp
-    f32[off+6] = cfg.baseHp; // maxHp
-    u32[off+7] = 1; // alive
-    u32[off+8] = 0; // dying
-    f32[off+9] = 0; // deathLeft
-    // color
-    const hue = rand()*6.28318
-    f32[off+10] = 0.6 + 0.4*Math.cos(hue)
-    f32[off+11] = 0.6 + 0.4*Math.cos(hue+2.094)
-    f32[off+12] = 0.6 + 0.4*Math.cos(hue+4.188)
-    f32[off+13] = 0 // pad
-  }
-  device.queue.writeBuffer(buffers.particles, 0, f32.buffer)
-
-  // reset counters
-  const zero = new Uint32Array([0, 4294967295])
-  device.queue.writeBuffer(buffers.counters, 0, zero)
-
-  // bind groups (after buffers exist)
-  bindGroups.sim = device.createBindGroup({ layout: pipelines.integrate.getBindGroupLayout(0), entries: [
-    { binding: 0, resource: { buffer: buffers.particles } },
-    { binding: 1, resource: { buffer: buffers.uniforms } },
-    { binding: 2, resource: { buffer: buffers.cellHead } },
-    { binding: 3, resource: { buffer: buffers.nextPtr } },
-    { binding: 4, resource: { buffer: buffers.counters } },
-  ]})
-  bindGroups.render = bindGroups.sim // same layout
+// ---- HP helpers ----
+function setAllHP() {
+  if (!worker) return
+  worker.postMessage({ type: 'hpSetAll', hp: ui.hpMax })
 }
 
-function writeUniforms(dt:number, gScale:number, time:number) {
-  // Pack in 20 floats (must match WGSL struct order)
-  const u = new ArrayBuffer(4*4*5)
-  const f = new Float32Array(u)
-  const ui = new Uint32Array(u)
-  const W = getCanvas().width, H = getCanvas().height
-  f[0]=dt; f[1]=W; f[2]=H; f[3]=cfg.speed;
-  f[4]=cfg.minSpeed; f[5]=cfg.maxSpeed; f[6]=cfg.elasticity; f[7]=cfg.accelOnWall;
-  f[8]=cfg.jitter; f[9]=gScale; f[10]=cellSize; f[11]=cfg.damageMin;
-  f[12]=cfg.damageMax; f[13]=cfg.accelOnHit; f[14]=cfg.deathFadeMs/1000; f[15]=time;
-  f[16]=gridW; f[17]=gridH; ui[18]=cfg.endless?1:0; ui[19]=0;
-  device.queue.writeBuffer(buffers.uniforms, 0, u)
+// ---- labels (names only) ----
+function buildLabelIndices() {
+  const K = Math.max(0, Math.min(ui.labelsCount, users.value.length))
+  if (K === 0) {
+    labelSlots = []
+    if (worker) worker.postMessage({ type: 'labelsConfig', indices: [], throttleMs: ui.labelsThrottleMs, sendOnce: true })
+    clearLabels()
+    return
+  }
+  const arr = new Int32Array(K)
+  for (let i = 0; i < K; i++) {
+    const base = Math.floor(((i + 0.5) * ui.aliveCount) / K)
+    const jitter = Math.floor((Math.random() - 0.5) * ui.aliveCount / (K * 4))
+    let idx = base + jitter; if (idx < 0) idx = 0; if (idx >= ui.aliveCount) idx = ui.aliveCount - 1
+    arr[i] = idx | 0
+  }
+  labelSlots = users.value.slice(0, K).map((u, i) => ({
+    id: arr[i], name: u?.name ?? '', x: 0, y: 0, tx: 0, ty: 0, hp01: 0, vis: 0
+  }))
+  if (worker) {
+    worker.postMessage({ type: 'labelsConfig', indices: Array.from(arr), throttleMs: ui.labelsThrottleMs, sendOnce: true })
+    sendGpuAvatarsList()
+  }
+}
+function clearLabels() {
+  const c = labelsRef.value!, ctx = c.getContext('2d')!
+  ctx.clearRect(0, 0, c.width, c.height)
+}
+function drawLabelsFromWorker(payload: any) {
+  if (!payload?.data || !labelSlots.length) return
+  lastRadiusPx = payload.radiusPx || lastRadiusPx
+  const arr = payload.data instanceof ArrayBuffer ? new Float32Array(payload.data) : new Float32Array(payload.data as number[])
+  const K = Math.min(labelSlots.length, Math.floor(arr.length / 3))
+  for (let i = 0; i < K; i++) {
+    labelSlots[i].tx = arr[i * 3 + 0]
+    labelSlots[i].ty = arr[i * 3 + 1]
+    labelSlots[i].hp01 = arr[i * 3 + 2]
+  }
+}
+function renderLabelsRAF() {
+  const c = labelsRef.value!; const ctx = c.getContext('2d')!
+  const now = performance.now(); const dt = Math.min(100, now - lastRAF); lastRAF = now
+  const tau = Math.max(1, ui.labelsSmoothMs); const a = 1 - Math.exp(-dt / tau)
+  ctx.clearRect(0, 0, c.width, c.height)
+  const pad = Math.max(2, Math.floor(4 * dpr)), fontPx = Math.max(10, Math.floor(12 * dpr))
+  ctx.font = `${fontPx}px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial`
+  ctx.textBaseline = 'middle'; ctx.lineJoin = 'round'
+  for (const s of labelSlots) {
+    s.x += (s.tx - s.x) * a
+    s.y += (s.ty - s.y) * a
+    const vTarget = s.hp01 > 0 ? 1 : 0
+    s.vis += (vTarget - s.vis) * a
+    if (s.vis < 0.05 || !s.name) continue
+    ctx.globalAlpha = s.vis
+    const tx = s.x + (lastRadiusPx || 8) + pad, ty = s.y
+    ctx.lineWidth = Math.max(2, Math.floor(3 * dpr))
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.strokeText(s.name, tx, ty)
+    ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.fillText(s.name, tx, ty)
+  }
+  ctx.globalAlpha = 1
+  rafId = requestAnimationFrame(renderLabelsRAF)
 }
 
-function computeGScale(alive:number, N0:number, dt:number){
-  if (!cfg.growthEnabled) return 1
-  const aliveFrac = alive / Math.max(1,N0)
-  const startDead = 1 - cfg.growthStartSurvivors
-  const fullDead  = 1 - cfg.growthFullSurvivors
-  const deadFrac  = 1 - aliveFrac
-  const t0 = Math.min(1, Math.max(0, (deadFrac - startDead) / Math.max(1e-6, (fullDead-startDead))))
-  const t = t0*t0*(3-2*t0)
-  const curved = Math.pow(t, cfg.growthExponent)
-  const target = 1 + (cfg.growthMaxScale - 1) * curved
-  // exponential smoothing
-  const tau = Math.max(0.001, cfg.growthSmoothSec)
-  gScaleCurrent = gScaleCurrent + (target - gScaleCurrent) * (1 - Math.pow(0.0001, dt / tau))
-  return gScaleCurrent
+function applyCountChange(n: number) {
+  const N = Math.max(1, n | 0);
+  ui.aliveCount = N;
+  if (worker && boot.started) {
+    worker.postMessage({ type: 'setCount', count: N });
+    // labels & GPU avatars depend on indices range -> rebuild
+    buildLabelIndices();
+    sendGpuAvatarsList();
+  }
 }
 
-let N0 = 0
-let gScaleCurrent = 1
-let lastAliveCPU = 0
-let timeSec = 0
-let readbackDivider = 8
-
-function frame(t: number) {
-  animation = requestAnimationFrame(frame)
-  if (!running.value) return
-  const dt = Math.min(0.033, last ? (t - last)/1000 : 0.016); last = t; timeSec += dt; frameId++
-
-  // Resize-derived grid (recreate grid if needed)
-  const W = getCanvas().width, H = getCanvas().height
-  const desired = Math.max(8, Math.ceil(2 * cfg.radiusMax * gScaleCurrent))
-  if (Math.abs(desired - cellSize) > 2) {
-    cellSize = desired; gridW = Math.max(1, Math.ceil(W / cellSize)); gridH = Math.max(1, Math.ceil(H / cellSize))
-    buffers.cellHead.destroy?.(); buffers.cellHead = device.createBuffer({ size: gridW*gridH*4, usage: GPUBufferUsage.STORAGE })
-    build() // rebind
+// ---- GPU avatars list ----
+function sendGpuAvatarsList() {
+  if (!worker || !ui.gpuAvatars) return
+  const entries: { index: number; url: string }[] = []
+  for (const s of labelSlots) {
+    const u = users.value.find(x => x.name === s.name)
+    if (u?.avatarUrl) entries.push({ index: s.id, url: u.avatarUrl })
   }
-
-  // Reset counters to 0 each frame before integrate
-  {
-    const zero = new Uint32Array([0, 4294967295])
-    device.queue.writeBuffer(buffers.counters, 0, zero)
+  if (entries.length === 0 && users.value.length > 0 && users.value[0].avatarUrl) {
+    entries.push({ index: 0, url: users.value[0].avatarUrl! })
   }
+  worker.postMessage({ type: 'avatarsSet', tile: ui.avatarTilePx || 64, entries })
+}
 
-  // uniforms (use previous gScaleCurrent; updated after readback)
-  writeUniforms(dt, gScaleCurrent, timeSec)
-
-  const encoder = device.createCommandEncoder()
-
-  // compute: integrate (also counts alive)
-  {
-    const pass = encoder.beginComputePass()
-    pass.setPipeline(pipelines.integrate)
-    pass.setBindGroup(0, bindGroups.sim)
-    pass.dispatchWorkgroups(Math.ceil(cfg.count / 256))
-    pass.end()
+// ---- pause/resume/restart ----
+function togglePause() {
+  if (!worker) return
+  ui.paused = !ui.paused
+  worker.postMessage({ type: ui.paused ? 'pause' : 'resume' })
+}
+async function countdown(sec: number) {
+  boot.counting = true
+  for (let s = sec; s >= 0; s--) {
+    boot.counter = s
+    await new Promise(r => setTimeout(r, 1000))
   }
+  boot.counting = false
+}
+async function startFight() {
+  if (boot.started) return
+  fit()
+  await countdown(3)
 
-  if (cfg.enableCollisions) {
-    // clear grid
-    {
-      const pass = encoder.beginComputePass()
-      pass.setPipeline(pipelines.clearGrid)
-      pass.setBindGroup(0, bindGroups.sim)
-      pass.dispatchWorkgroups(Math.ceil((gridW*gridH) / 256))
-      pass.end()
+  worker = new Worker(new URL('../workers/points.worker.ts', import.meta.url), { type: 'module' })
+
+  worker.onmessage = (e: MessageEvent) => {
+    const m = e.data as any
+    if (m?.type === 'labels') {
+      lastRadiusPx = m.radiusPx || lastRadiusPx
+      lastAliveCount = typeof m.aliveCount === 'number' ? m.aliveCount : lastAliveCount
+      drawLabelsFromWorker(m)
+      return
     }
-    // build grid
-    {
-      const pass = encoder.beginComputePass()
-      pass.setPipeline(pipelines.buildGrid)
-      pass.setBindGroup(0, bindGroups.sim)
-      pass.dispatchWorkgroups(Math.ceil(cfg.count / 256))
-      pass.end()
+    if (m?.type === 'avatarsReady') {
+      console.log('[GPU] avatarsReady:', m.tiles, 'tiles, atlas', m.atlasW, 'x', m.atlasH)
+      return
     }
-    // collide (approx; self-only updates to avoid races)
-    {
-      const pass = encoder.beginComputePass()
-      pass.setPipeline(pipelines.collide)
-      pass.setBindGroup(0, bindGroups.sim)
-      pass.dispatchWorkgroups(Math.ceil(cfg.count / 256))
-      pass.end()
+    if (m?.type === 'winner') {
+      const idx = m.index | 0
+      winner.value = { index: idx, name: nameForIndex(idx), avatarUrl: avatarForIndex(idx), hp: m.hp }
+      return
+    }
+    if (m?.type === 'error') {
+      console.error('Worker error:', m.error)
+      return
     }
   }
 
-  // render
-  const rpass = encoder.beginRenderPass({
-    colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', clearValue: { r: 0.043, g: 0.063, b: 0.125, a: 1 }, storeOp: 'store' }]
-  })
-  rpass.setPipeline(pipelines.render)
-  rpass.setBindGroup(0, bindGroups.render)
-  rpass.draw(4, cfg.count)
-  rpass.end()
+  const c = pointsRef.value!
+  const off = (c as any).transferControlToOffscreen() as OffscreenCanvas
+  worker.postMessage({
+    type: 'init',
+    canvas: off,
+    width: c.width,
+    height: c.height,
+    dpr,
+    count: ui.aliveCount,
+    maxFps: ui.fps
+  }, [off])
+  offscreenTransferred = true
 
-  // read alive once in a while
-  if ((frameId % readbackDivider) === 0) {
-    encoder.copyBufferToBuffer(buffers.counters, 0, buffers.countersRead, 0, 8)
+  pushConfig()
+  // ask worker to stream label positions
+  buildLabelIndices()
+  // send GPU avatars list
+  sendGpuAvatarsList()
+
+  boot.started = true
+}
+async function restartFight() {
+  if (!boot.started) {
+    await startFight()
+    return
   }
-
-  device.queue.submit([encoder.finish()])
-
-  // map readback if we scheduled it
-  if ((frameId % readbackDivider) === 0) {
-    const GPUMapMode = (navigator as any).gpu?.GPUMapMode || { READ: 0x0001, WRITE: 0x0002 };
-    buffers.countersRead.mapAsync(GPUMapMode.READ).then(()=>{
-      const arr = new Uint32Array(buffers.countersRead.getMappedRange())
-      const alive = arr[0]; const lastAlive = arr[1]
-      buffers.countersRead.unmap()
-      lastAliveCPU = alive
-      winnerIdx.value = (alive === 1 && !cfg.endless) ? lastAlive : -1
-      gScaleCurrent = computeGScale(alive, N0, dt)
-    }).catch(()=>{})
-  } else {
-    // keep smoothing with last known alive
-    gScaleCurrent = computeGScale(lastAliveCPU, N0, dt)
-  }
+  await countdown(3)
+  winner.value = null
+  ui.paused = false
+  worker?.postMessage({ type: 'reset' })
 }
 
-async function start() {
-  await nextTick()
-  if (!device) { await init() }
-  resize(); allocBuffers(); build();
-  N0 = cfg.count; lastAliveCPU = N0; gScaleCurrent = 1; winnerIdx.value = -1; frameId = 0; timeSec = 0
-  running.value = true
-  last = performance.now()
-  requestAnimationFrame(frame)
+// ---- winner helpers ----
+type Winner = { index: number; name: string; avatarUrl?: string; hp: number }
+const winner = ref<Winner | null>(null)
+function nameForIndex(i: number): string {
+  const n = users.value.length
+  if (n === ui.aliveCount) return users.value[i]?.name ?? `Follower ${i + 1}`
+  if (n > 0) return users.value[i % n]?.name ?? `Follower ${i + 1}`
+  return `Follower ${i + 1}`
+}
+function avatarForIndex(i: number): string | undefined {
+  const n = users.value.length
+  if (n === ui.aliveCount) return users.value[i]?.avatarUrl
+  if (n > 0) return users.value[i % n]?.avatarUrl
+  return undefined
 }
 
-function pause(){ running.value = false }
-function resume(){ if (!device) return; running.value = true; last = performance.now(); requestAnimationFrame(frame) }
-
-async function reset() {
-  running.value = false
-  if (!device) return
-  allocBuffers(); build();
-  N0 = cfg.count; lastAliveCPU = N0; gScaleCurrent = 1; winnerIdx.value = -1
+// ---- auto tune ----
+const clampNum = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v))
+function autoTuneNow() {
+  const nUsers = users.value.length
+  const N = Math.max(nUsers, ui.aliveCount)
+  const L = (want: number) => clampNum(want, 0, nUsers)
+  let preset: Partial<typeof ui> = {}
+  if (N <= 1000) preset = { collisions: true, cellSizePx: 24, maxPairsPerCell: 512, labelsCount: L(200), labelsThrottleMs: 30, labelsSmoothMs: 120, radiusCss: 7, speedCss: 80, minSpeedCss: 20, maxSpeedCss: 200 }
+  else if (N <= 10000) preset = { collisions: true, cellSizePx: 28, maxPairsPerCell: 256, labelsCount: L(128), labelsThrottleMs: 40, labelsSmoothMs: 140, radiusCss: 6, speedCss: 80, minSpeedCss: 20, maxSpeedCss: 180 }
+  else if (N <= 50000) preset = { collisions: true, cellSizePx: 32, maxPairsPerCell: 128, labelsCount: L(96), labelsThrottleMs: 45, labelsSmoothMs: 150, radiusCss: 6, speedCss: 80, minSpeedCss: 20, maxSpeedCss: 160 }
+  else if (N <= 100000) preset = { collisions: false, labelsCount: L(72), labelsThrottleMs: 50, labelsSmoothMs: 160, radiusCss: 6, speedCss: 80, minSpeedCss: 18, maxSpeedCss: 150 }
+  else if (N <= 300000) preset = { collisions: false, labelsCount: L(56), labelsThrottleMs: 60, labelsSmoothMs: 170, radiusCss: 5, speedCss: 75, minSpeedCss: 16, maxSpeedCss: 140 }
+  else preset = { collisions: false, labelsCount: L(32), labelsThrottleMs: 70, labelsSmoothMs: 180, radiusCss: 5, speedCss: 70, minSpeedCss: 14, maxSpeedCss: 130 }
+  Object.assign(ui, preset)
+  buildLabelIndices()
+  pushConfig()
 }
 
+// ---- lifecycle ----
 onMounted(() => {
-  const onResize = () => resize()
-  window.addEventListener('resize', onResize)
-  onBeforeUnmount(() => window.removeEventListener('resize', onResize))
-})
+  fit()
+  if (stageRef.value) { ro = new ResizeObserver(() => fit()); ro.observe(stageRef.value) }
+  window.addEventListener('resize', fit)
 
-// --- tiny rng ---
-function mulberry32(a: number){ let t = a>>>0; return ()=>{ t+=0x6D2B79F5; let r=Math.imul(t^t>>>15,t|1); r^=r+Math.imul(r^r>>>7,r|61); return ((r^r>>>14)>>>0)/4294967296 } }
+  parseUsersJSON()
+  buildLabelIndices()
+
+  lastRAF = performance.now()
+  rafId = requestAnimationFrame(renderLabelsRAF)
+
+  // watchers
+  watch(() => [
+    ui.radiusCss, ui.speedCss, ui.color, ui.bg,
+    ui.ringColor, ui.ringWidthPx, ui.fps,
+    ui.collisions, ui.cellSizePx, ui.maxPairsPerCell,
+    ui.hpMax, ui.dmgHitMin, ui.dmgHitMax,
+    ui.minSpeedCss, ui.maxSpeedCss, ui.hitBoostPct, ui.wallBoostPct,
+    ui.autoRadius, ui.radiusScaleMax, ui.radiusScaleExp,
+  ], pushConfig)
+
+  watch(() => ui.dmgHitMin, v => { if (ui.dmgHitMax < v) ui.dmgHitMax = v })
+  watch(() => ui.dmgHitMax, v => { if (v < ui.dmgHitMin) ui.dmgHitMin = v })
+  watch(() => ui.minSpeedCss, v => { if (ui.maxSpeedCss < v) ui.maxSpeedCss = v })
+  watch(() => ui.maxSpeedCss, v => { if (v < ui.minSpeedCss) ui.minSpeedCss = v })
+  watch(usersJson, parseUsersJSON)
+  watch(() => ui.aliveCount, v => applyCountChange(v));
+  watch(users, () => { if (ui.autoTune) autoTuneNow(); buildLabelIndices(); }, { deep: true })
+  watch(() => ui.labelsCount, buildLabelIndices)
+  watch(() => [ui.gpuAvatars, ui.avatarTilePx], () => sendGpuAvatarsList())
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', fit)
+  if (ro && stageRef.value) ro.unobserve(stageRef.value)
+  if (rafId) cancelAnimationFrame(rafId)
+  worker?.terminate(); worker = null
+})
 </script>
 
 <template>
-  <div class="bg-[#0b1020] min-h-screen text-slate-200">
-    <div class="space-y-4 mx-auto p-4 md:p-6">
-      <header class="flex justify-between items-center gap-4">
-        <h1 class="font-bold text-2xl md:text-3xl tracking-tight">Followers Fight — WebGPU</h1>
-        <div class="flex items-center gap-2">
-          <button @click="start" class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-2xl">Start</button>
-          <button @click="pause" class="bg-slate-700 hover:bg-slate-600 px-3 py-2 rounded-2xl">Pause</button>
-          <button @click="resume" class="bg-slate-700 hover:bg-slate-600 px-3 py-2 rounded-2xl">Resume</button>
-          <button @click="reset" class="bg-slate-700 hover:bg-slate-600 px-3 py-2 rounded-2xl">Reset</button>
-        </div>
-      </header>
+  <!-- Full-height layout with side panel -->
+  <div class="gap-3 grid grid-cols-1 lg:grid-cols-[1fr_20rem] bg-slate-950 w-full h-screen">
+    <!-- Stage -->
+    <div ref="stageRef" class="relative rounded-xl ring-1 ring-slate-800 h-full overflow-hidden">
+      <!-- WebGL / Offscreen target -->
+      <canvas ref="pointsRef" class="block bg-transparent w-full h-full"></canvas>
+      <!-- 2D overlay for labels (names only; avatars are on GPU) -->
+      <canvas ref="labelsRef" class="z-10 absolute inset-0 pointer-events-none"></canvas>
 
-      <section class="gap-4 grid grid-cols-1 lg:grid-cols-3">
-        <div class="space-y-4 lg:col-span-1">
-          <div class="space-y-3 bg-slate-800/60 p-4 border border-slate-700/50 rounded-2xl">
-            <h2 class="font-semibold">Parameters</h2>
-            <div class="gap-3 grid grid-cols-2 text-sm">
-              <LabeledNumber label="Particles" v-model.number="cfg.count" :min="1000" :max="2000000" :step="1000" />
-              <LabeledNumber label="Seed" v-model.number="seed" :min="0" :max="999999" />
+      <!-- Start overlay -->
+      <div v-if="!boot.started" class="z-20 absolute inset-0 flex justify-center items-center">
+        <div class="absolute inset-0 bg-black/60"></div>
+        <div class="z-10 relative flex flex-col items-center gap-4">
+          <button
+            v-show="!boot.counting"
+            class="bg-emerald-600 hover:bg-emerald-500 shadow-lg px-6 py-3 rounded-xl font-semibold text-white text-lg"
+            @click="startFight"
+            :disabled="boot.counting"
+          >
+            Start
+          </button>
 
-              <LabeledNumber label="HP" v-model.number="cfg.baseHp" :min="1" :max="2000" />
-              <LabeledNumber label="Damage min" v-model.number="cfg.damageMin" :min="0" :max="200" />
-              <LabeledNumber label="Damage max" v-model.number="cfg.damageMax" :min="0" :max="400" />
-
-              <LabeledRange label="Elasticity" v-model.number="cfg.elasticity" :min="0" :max="1" :step="0.01" />
-              <LabeledRange label="Base speed" v-model.number="cfg.speed" :min="0.2" :max="3" :step="0.05" />
-              <LabeledNumber label="Min speed (px/s)" v-model.number="cfg.minSpeed" :min="0" :max="2000" />
-              <LabeledNumber label="Max speed (px/s)" v-model.number="cfg.maxSpeed" :min="10" :max="5000" />
-              <LabeledNumber label="Accel on hit (×)" v-model.number="cfg.accelOnHit" :min="1" :max="3" :step="0.01" />
-              <LabeledNumber label="Accel on wall (×)" v-model.number="cfg.accelOnWall" :min="1" :max="3" :step="0.01" />
-              <LabeledNumber label="Jitter (px/s²)" v-model.number="cfg.jitter" :min="0" :max="500" />
-
-              <LabeledNumber label="Radius min" v-model.number="cfg.radiusMin" :min="1" :max="30" />
-              <LabeledNumber label="Radius max" v-model.number="cfg.radiusMax" :min="1" :max="60" />
-
-              <LabeledNumber label="Death fade (ms)" v-model.number="cfg.deathFadeMs" :min="50" :max="4000" :step="50" />
-              <LabeledRange label="Death shrink" v-model.number="cfg.deathShrink" :min="0" :max="1" :step="0.05" />
-
-              <label class="flex items-center gap-2 col-span-2 text-sm">
-                <input type="checkbox" v-model="cfg.growthEnabled" class="accent-emerald-500">
-                <span>Grow as players die</span>
-              </label>
-              <LabeledNumber label="Growth max scale" v-model.number="cfg.growthMaxScale" :min="1" :max="10" :step="0.05" />
-              <LabeledNumber label="Growth exponent" v-model.number="cfg.growthExponent" :min="0.25" :max="3" :step="0.05" />
-              <LabeledNumber label="Growth start survivors" v-model.number="cfg.growthStartSurvivors" :min="0" :max="1" :step="0.05" />
-              <LabeledNumber label="Growth full survivors" v-model.number="cfg.growthFullSurvivors" :min="0" :max="1" :step="0.05" />
-              <LabeledNumber label="Growth smooth (s)" v-model.number="cfg.growthSmoothSec" :min="0" :max="2" :step="0.05" />
-
-              <label class="flex items-center gap-2 col-span-2 text-sm">
-                <input type="checkbox" v-model="cfg.enableCollisions" class="accent-emerald-500"/>
-                <span>Collisions (grid, approximate)</span>
-              </label>
-              <label class="flex items-center gap-2 col-span-2 text-sm">
-                <input type="checkbox" v-model="cfg.endless" class="accent-emerald-500"/>
-                <span>Endless mode (respawn)</span>
-              </label>
-            </div>
-            <p class="text-slate-400 text-xs">This version uses <b> Webgpu </b>: integration, rebounds, approximate conflicts and death/growth are performed in compute. Growth - from the proportion of those who remain.</p>
+          <div v-if="boot.counting" class="font-extrabold text-white text-center transition-all duration-300 ease-out">
+            <div class="drop-shadow-xl tabular-nums text-7xl">{{ boot.counter }}</div>
+            <div class="mt-1 text-slate-200 text-sm">Get ready</div>
           </div>
         </div>
+      </div>
 
-        <div class="space-y-3 lg:col-span-2">
-          <div class="border border-slate-700/50 rounded-2xl overflow-hidden">
-            <canvas ref="canvasRef" class="block bg-[#0b1020] w-full h-auto"  />
+      <!-- In-run countdown (for Restart) -->
+      <div v-if="boot.started && boot.counting" class="z-20 absolute inset-0 flex justify-center items-center">
+        <div class="absolute inset-0 bg-black/40"></div>
+        <div class="z-10 relative drop-shadow-xl font-extrabold tabular-nums text-white text-7xl">
+          {{ boot.counter }}
+        </div>
+      </div>
+
+      <!-- Winner modal -->
+      <div v-if="winner" class="z-20 absolute inset-0 flex justify-center items-center">
+        <div class="absolute inset-0 bg-black/60"></div>
+        <div class="z-10 relative bg-slate-900/95 shadow-2xl p-6 border border-slate-700 rounded-2xl max-w-sm text-center">
+          <div class="font-extrabold text-white text-3xl">Winner</div>
+
+          <div v-if="winner.avatarUrl" class="mx-auto mt-4 rounded-full ring-4 ring-emerald-400/70 w-24 h-24 overflow-hidden">
+            <img :src="winner.avatarUrl" crossorigin="anonymous" class="w-full h-full object-cover" />
           </div>
-          <div class="flex items-center gap-4 text-slate-400 text-xs">
-            <span>{{ statsText }}</span>
-            <span v-if="winnerIdx>=0">• Winner: #{{ winnerIdx }}</span>
+
+          <div class="mt-3 font-semibold text-slate-100 text-xl">{{ winner.name }}</div>
+          <div class="mt-1 text-slate-400 text-sm">HP: {{ Math.round(winner.hp) }}</div>
+
+          <div class="flex justify-center gap-2 mt-5">
+            <button class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-lg font-medium text-white" @click="restartFight">
+              Start new fight
+            </button>
+            <button class="bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded-lg text-white" @click="winner = null">
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mobile controls -->
+      <div class="lg:hidden bottom-3 left-3 z-10 absolute flex gap-2">
+        <button
+          class="bg-sky-600 hover:bg-sky-500 shadow px-3 py-2 rounded-lg font-medium text-white text-sm"
+          @click="togglePause"
+          :disabled="!boot.started || boot.counting"
+        >
+          {{ ui.paused ? 'Resume' : 'Pause' }}
+        </button>
+        <button
+          class="bg-rose-600 hover:bg-rose-500 shadow px-3 py-2 rounded-lg font-medium text-white text-sm"
+          @click="restartFight"
+          :disabled="boot.counting || !boot.started"
+        >
+          Restart
+        </button>
+      </div>
+    </div>
+
+    <!-- Side panel -->
+    <aside class="hidden lg:block bg-slate-900/90 p-4 border border-slate-800 rounded-xl h-screen overflow-auto text-slate-200">
+      <section class="mb-4">
+        <label class="inline-flex items-center gap-2">
+          <input type="checkbox" v-model="ui.autoTune" class="accent-emerald-500" />
+          <span class="text-sm">Авто-підлаштування</span>
+        </label>
+        <button class="bg-slate-700 hover:bg-slate-600 mt-2 px-2 py-1 rounded text-xs" @click="autoTuneNow">Re-tune now</button>
+      </section>
+
+      <!-- Users JSON -->
+      <section>
+        <h3 class="mb-2 font-semibold text-slate-100">Користувачі (JSON)</h3>
+        <textarea
+          v-model="usersJson"
+          @change="parseUsersJSON"
+          class="bg-slate-800 p-2 border border-slate-700 rounded-md w-full h-28 text-xs"
+          spellcheck="false"
+        ></textarea>
+        <div class="flex justify-between items-center mt-1 text-slate-400 text-xs">
+          <div>Знайдено: <span class="tabular-nums">{{ users.length }}</span></div>
+          <button class="bg-slate-700 hover:bg-slate-600 px-2 py-1 rounded" @click="parseUsersJSON">Apply</button>
+        </div>
+      </section>
+
+      <!-- Core settings -->
+      <section class="mt-4">
+        <h3 class="mb-2 font-semibold text-slate-100">Налаштування</h3>
+        <LabeledNumber v-model.number="ui.aliveCount" label="Кількість кружечків" :min="10" :max="10000000" :step="1" />
+        <LabeledRange v-model.number="ui.ringWidthPx" label="Товщина лінії ХР (px)" :min="1" :max="6" :step="1" />
+        <LabeledRange v-model.number="ui.radiusCss" label="Радіус (px)" :min="2" :max="12" :step="1" />
+        <LabeledRange v-model.number="ui.speedCss" label="Швидкість (px/s)" :min="10" :max="200" :step="1" />
+        <LabeledRange v-model.number="ui.fps" label="FPS" :min="30" :max="120" :step="1" />
+        <div class="gap-3 grid grid-cols-2 mt-3">
+          <div>
+            <div class="mb-1 text-slate-300 text-sm">Колір точок</div>
+            <input type="color" v-model="ui.color" class="bg-slate-800 border border-slate-700 rounded-md w-full h-9" />
+          </div>
+          <div>
+            <div class="mb-1 text-slate-300 text-sm">Фон</div>
+            <input type="color" v-model="ui.bg" class="bg-slate-800 border border-slate-700 rounded-md w-full h-9" />
           </div>
         </div>
       </section>
-    </div>
+      <!-- Labels / avatars -->
+      <section class="mt-4 pt-4 border-slate-800 border-t">
+        <h3 class="mb-2 font-semibold text-slate-100">Підписи</h3>
+        <LabeledRange v-model.number="ui.labelsCount" label="Кількість підписів" :min="0" :max="256" :step="1" />
+        <LabeledRange v-model.number="ui.labelsSmoothMs" label="Плавність підписів (мс)" :min="16" :max="600" :step="1" />
+        <LabeledNumber v-model.number="ui.labelsThrottleMs" label="Оновлення позицій (мс)" :min="8" :max="200" :step="1" />
+        <div class="gap-3 grid grid-cols-2 mt-3">
+          <LabeledNumber v-model.number="ui.avatarTilePx" label="Розмір тайла аватара" :min="32" :max="128" :step="1" />
+          <label class="inline-flex items-center gap-2">
+            <input type="checkbox" v-model="ui.gpuAvatars" class="accent-emerald-500" />
+            <span class="text-sm">GPU-аватарки (атлас)</span>
+          </label>
+        </div>
+        <p class="mt-2 text-slate-400 text-xs">Аватарки рендеряться на GPU всередині кружків. Текст — на оверлеї.</p>
+      </section>     
+
+      <!-- Auto radius -->
+      <section class="mt-4 pt-4 border-slate-800 border-t">
+        <h3 class="mb-2 font-semibold text-slate-100">Авто-радіус</h3>
+        <label class="inline-flex items-center gap-2">
+          <input type="checkbox" v-model="ui.autoRadius" class="accent-emerald-500" />
+          <span class="text-sm">Вмикати автоматичне збільшення радіуса</span>
+        </label>
+        <LabeledRange v-model.number="ui.radiusScaleMax" label="Max scale (×)" :min="1" :max="20" :step="0.1" />
+        <LabeledRange v-model.number="ui.radiusScaleExp" label="Експонента (крива)" :min="0.1" :max="8" :step="0.1" />
+      </section>
+
+      <!-- Collisions -->
+      <section class="mt-5 pt-4 border-slate-800 border-t">
+        <h3 class="mb-2 font-semibold text-slate-100">Колізії</h3>
+        <label class="inline-flex items-center gap-2">
+          <input type="checkbox" v-model="ui.collisions" class="accent-emerald-500" />
+          <span class="text-sm">Увімкнути колізії (апрокс.)</span>
+        </label>
+        <LabeledRange v-model.number="ui.cellSizePx" label="Розмір ґріда (px)" :min="8" :max="64" :step="1" />
+        <LabeledRange v-model.number="ui.maxPairsPerCell" label="Ліміт пар/клітинку" :min="32" :max="512" :step="32" />
+      </section>
+
+      <!-- Speed & boosts -->
+      <section class="mt-4 pt-4 border-slate-800 border-t">
+        <h3 class="mb-2 font-semibold text-slate-100">Швидкість та буст</h3>
+        <LabeledRange v-model.number="ui.minSpeedCss" label="Мін. швидкість (px/s)" :min="0" :max="300" :step="1" />
+        <LabeledRange v-model.number="ui.maxSpeedCss" label="Макс. швидкість (px/s)" :min="ui.minSpeedCss" :max="800" :step="1" />
+        <div class="gap-3 grid grid-cols-2 mt-3">
+          <LabeledRange v-model.number="ui.hitBoostPct" label="Буст при зіткненні (%)" :min="0" :max="100" :step="1" />
+          <LabeledRange v-model.number="ui.wallBoostPct" label="Буст від стіни (%)" :min="0" :max="100" :step="1" />
+        </div>
+      </section>
+
+      <!-- Health -->
+      <section class="mt-4 pt-4 border-slate-800 border-t">
+        <h3 class="mb-2 font-semibold text-slate-100">Здоров'я (HP)</h3>
+        <LabeledRange v-model.number="ui.hpMax" label="Max HP" :min="1" :max="2500" :step="1" />
+        <div class="gap-3 grid grid-cols-2 mt-3">
+          <LabeledRange v-model.number="ui.dmgHitMin" label="DMG min" :min="0" :max="50" :step="1" />
+          <LabeledRange v-model.number="ui.dmgHitMax" label="DMG max" :min="ui.dmgHitMin" :max="50" :step="1" />
+        </div>
+        <button class="bg-rose-600 hover:bg-rose-500 shadow mt-3 px-3 py-2 rounded-lg font-medium text-white text-sm" @click="setAllHP">
+          Set HP for all
+        </button>
+      </section>
+
+      <!-- Actions -->
+      <section class="flex gap-2 mt-5">
+        <button
+          class="bg-sky-600 hover:bg-sky-500 shadow px-3 py-2 rounded-lg font-medium text-white text-sm"
+          @click="togglePause"
+          :disabled="!boot.started || boot.counting"
+        >
+          {{ ui.paused ? 'Resume' : 'Pause' }}
+        </button>
+        <button
+          class="bg-rose-600 hover:bg-rose-500 shadow px-3 py-2 rounded-lg font-medium text-white text-sm"
+          @click="restartFight"
+          :disabled="boot.counting || !boot.started"
+        >
+          Restart
+        </button>
+      </section>
+    </aside>
   </div>
 </template>
+
