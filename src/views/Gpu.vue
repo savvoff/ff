@@ -38,7 +38,7 @@ const defaultParams = {
   fps: 60,
   paused: false,
   // auto tune
-  autoTune: true,
+  autoTune: false,
   // GPU avatars
   gpuAvatars: true,
   avatarTilePx: 64,
@@ -68,7 +68,7 @@ const boot = reactive({ started: false, counting: false, counter: 0 })
 
 const rawJsonString = JSON.stringify(demo);
 const usersJson = ref(rawJsonString)
-type User = { name: string; avatarUrl?: string }
+type User = { name: string; avatarUrl?: string, profileUrl?: string }
 const users = ref<User[]>([])
 
 function parseUsersJSON() {
@@ -79,6 +79,25 @@ function parseUsersJSON() {
       buildLabelIndices()
     }
   } catch {}
+}
+
+// ---------- Followers ingest ----------
+function parseTextFollowers(text: string): User[] {
+  try {
+    const arr = JSON.parse(text)
+    if (Array.isArray(arr)) return arr.filter(x => x && typeof x.name === 'string').map(x => ({ name: String(x.name), avatarUrl: x.avatarUrl }))
+  } catch {}
+  return text.split(/\r?\n/).map(s => s.trim()).filter(Boolean).map(name => ({ name }))
+}
+
+async function onFile(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  const text = await file.text()
+  users.value = parseTextFollowers(text)
+  usersJson.value = JSON.stringify(users.value)
+  input.value = ''
 }
 
 // ---- sizing ----
@@ -463,12 +482,12 @@ onBeforeUnmount(() => {
 
     <!-- Side panel -->
     <aside class="hidden lg:block bg-slate-900/90 p-4 border border-slate-800 rounded-xl h-screen overflow-auto text-slate-200">
-      <section class="mb-4">
+      <section class="flex items-center gap-2 mb-4">
         <label class="inline-flex items-center gap-2">
           <input type="checkbox" v-model="ui.autoTune" class="accent-emerald-500" />
           <span class="text-sm">Авто-підлаштування</span>
         </label>
-        <button class="bg-slate-700 hover:bg-slate-600 mt-2 px-2 py-1 rounded text-xs" @click="autoTuneNow">Re-tune now</button>
+        <button class="bg-slate-700 hover:bg-slate-600 px-2 py-1 rounded text-xs" @click="autoTuneNow">Re-tune now</button>
       </section>
 
       <!-- Users JSON -->
@@ -480,8 +499,12 @@ onBeforeUnmount(() => {
           class="bg-slate-800 p-2 border border-slate-700 rounded-md w-full h-28 text-xs"
           spellcheck="false"
         ></textarea>
-        <div class="flex justify-between items-center mt-1 text-slate-400 text-xs">
-          <div>Знайдено: <span class="tabular-nums">{{ users.length }}</span></div>
+        <div class="flex items-center gap-2 mt-1 text-slate-400 text-xs">
+          <div class="mr-auto">Знайдено: <span class="tabular-nums">{{ users.length }}</span></div>
+          <label class="inline-flex items-center bg-slate-700 hover:bg-slate-600 px-2 py-1 rounded cursor-pointer">
+            <input type="file" accept=".json,.txt,.csv" class="hidden" @change="onFile" />
+            Upload file
+          </label>
           <button class="bg-slate-700 hover:bg-slate-600 px-2 py-1 rounded" @click="parseUsersJSON">Apply</button>
         </div>
       </section>
@@ -508,7 +531,7 @@ onBeforeUnmount(() => {
       <!-- Labels / avatars -->
       <section class="mt-4 pt-4 border-slate-800 border-t">
         <h3 class="mb-2 font-semibold text-slate-100">Підписи</h3>
-        <LabeledRange v-model.number="ui.labelsCount" label="Кількість підписів" :min="0" :max="256" :step="1" />
+        <LabeledRange v-model.number="ui.labelsCount" label="Кількість підписів" :min="0" :max="2000" :step="1" />
         <LabeledRange v-model.number="ui.labelsSmoothMs" label="Плавність підписів (мс)" :min="16" :max="600" :step="1" />
         <LabeledNumber v-model.number="ui.labelsThrottleMs" label="Оновлення позицій (мс)" :min="8" :max="200" :step="1" />
         <div class="gap-3 grid grid-cols-2 mt-3">
