@@ -170,21 +170,48 @@ function buildLabelIndices() {
     clearLabels()
     return
   }
-  const arr = new Int32Array(K)
+
+  // build K unique indices in [0..aliveCount)
+  const indices = new Int32Array(K)
+  const taken = new Set<number>()
+  const step = Math.max(1, Math.floor(ui.aliveCount / K))
+
   for (let i = 0; i < K; i++) {
-    const base = Math.floor(((i + 0.5) * ui.aliveCount) / K)
-    const jitter = Math.floor((Math.random() - 0.5) * ui.aliveCount / (K * 4))
-    let idx = base + jitter; if (idx < 0) idx = 0; if (idx >= ui.aliveCount) idx = ui.aliveCount - 1
-    arr[i] = idx | 0
+    const base = Math.floor((i + 0.5) * step)
+    const jitter = Math.floor((Math.random() - 0.5) * step * 0.5)
+    let idx = Math.min(ui.aliveCount - 1, Math.max(0, (base + jitter) | 0))
+
+    // ensure uniqueness
+    let tries = 0
+    while (taken.has(idx) && tries++ < 8) idx = (idx + 1) % ui.aliveCount
+    if (taken.has(idx)) {
+      let r = (Math.random() * ui.aliveCount) | 0
+      while (taken.has(r)) r = (r + 1) % ui.aliveCount
+      idx = r
+    }
+
+    taken.add(idx)
+    indices[i] = idx
   }
-  labelSlots = users.value.slice(0, K).map((u, i) => ({
-    id: arr[i], name: u?.name ?? '', x: 0, y: 0, tx: 0, ty: 0, hp01: 0, vis: 0
+
+  // names must match selected particle indices
+  labelSlots = Array.from(indices, (id) => ({
+    id,
+    name: nameForIndex(id),
+    x: 0, y: 0, tx: 0, ty: 0, hp01: 0, vis: 0
   }))
+
   if (worker) {
-    worker.postMessage({ type: 'labelsConfig', indices: Array.from(arr), throttleMs: ui.labelsThrottleMs, sendOnce: true })
+    worker.postMessage({
+      type: 'labelsConfig',
+      indices: Array.from(indices),
+      throttleMs: ui.labelsThrottleMs,
+      sendOnce: true
+    })
     sendGpuAvatarsList()
   }
 }
+
 function clearLabels() {
   const c = labelsRef.value!, ctx = c.getContext('2d')!
   ctx.clearRect(0, 0, c.width, c.height)
@@ -200,25 +227,56 @@ function drawLabelsFromWorker(payload: any) {
     labelSlots[i].hp01 = arr[i * 3 + 2]
   }
 }
+
 function renderLabelsRAF() {
   const c = labelsRef.value!; const ctx = c.getContext('2d')!
   const now = performance.now(); const dt = Math.min(100, now - lastRAF); lastRAF = now
   const tau = Math.max(1, ui.labelsSmoothMs); const a = 1 - Math.exp(-dt / tau)
+
   ctx.clearRect(0, 0, c.width, c.height)
   const pad = Math.max(2, Math.floor(4 * dpr)), fontPx = Math.max(10, Math.floor(12 * dpr))
   ctx.font = `${fontPx}px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial`
   ctx.textBaseline = 'middle'; ctx.lineJoin = 'round'
+
+  // keep occupied boxes to reduce overlaps
+  type Box = { x: number; y: number; w: number; h: number }
+  const boxes: Box[] = []
+  const intersects = (a: Box, b: Box) =>
+    !(a.x + a.w < b.x || b.x + b.w < a.x || a.y + a.h < b.y || b.y + b.h < a.y)
+
   for (const s of labelSlots) {
     s.x += (s.tx - s.x) * a
     s.y += (s.ty - s.y) * a
     const vTarget = s.hp01 > 0 ? 1 : 0
     s.vis += (vTarget - s.vis) * a
     if (s.vis < 0.05 || !s.name) continue
+
     ctx.globalAlpha = s.vis
-    const tx = s.x + (lastRadiusPx || 8) + pad, ty = s.y
+    const baseX = s.x + (lastRadiusPx || 8) + pad
+    let drawX = baseX
+    let drawY = s.y
+
+    const textW = Math.ceil(ctx.measureText(s.name).width)
+    const textH = fontPx
+    let box: Box = { x: drawX - pad, y: drawY - textH * 0.5, w: textW + pad * 2, h: textH }
+
+    // simple vertical nudge to avoid overlaps
+    let attempts = 0
+    while (boxes.some(b => intersects(box, b)) && attempts < 6) {
+      const shift = (attempts % 2 === 0 ? -1 : 1) * (textH + 2)
+      drawY += shift
+      box = { x: drawX - pad, y: drawY - textH * 0.5, w: textW + pad * 2, h: textH }
+      attempts++
+    }
+    if (boxes.some(b => intersects(box, b))) continue // still overlaps; skip
+
+    boxes.push(box)
+
     ctx.lineWidth = Math.max(2, Math.floor(3 * dpr))
-    ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.strokeText(s.name, tx, ty)
-    ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.fillText(s.name, tx, ty)
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)'
+    ctx.strokeText(s.name, drawX, drawY)
+    ctx.fillStyle = 'rgba(255,255,255,0.95)'
+    ctx.fillText(s.name, drawX, drawY)
   }
   ctx.globalAlpha = 1
   rafId = requestAnimationFrame(renderLabelsRAF)
@@ -239,14 +297,26 @@ function applyCountChange(n: number) {
 function sendGpuAvatarsList() {
   if (!worker || !ui.gpuAvatars) return
   const entries: { index: number; url: string }[] = []
+
   for (const s of labelSlots) {
-    const u = users.value.find(x => x.name === s.name)
-    if (u?.avatarUrl) entries.push({ index: s.id, url: u.avatarUrl })
+    const url = avatarForIndex(s.id)
+    if (url) entries.push({ index: s.id, url })
   }
-  if (entries.length === 0 && users.value.length > 0 && users.value[0].avatarUrl) {
-    entries.push({ index: 0, url: users.value[0].avatarUrl! })
+
+  // de-duplicate (same index+url pairs)
+  const seen = new Set<string>()
+  const dedup = entries.filter(e => {
+    const k = `${e.index}|${e.url}`
+    if (seen.has(k)) return false
+    seen.add(k)
+    return true
+  })
+
+  if (dedup.length === 0 && users.value.length > 0 && users.value[0].avatarUrl) {
+    dedup.push({ index: 0, url: users.value[0].avatarUrl! })
   }
-  worker.postMessage({ type: 'avatarsSet', tile: ui.avatarTilePx || 64, entries })
+
+  worker.postMessage({ type: 'avatarsSet', tile: ui.avatarTilePx || 64, entries: dedup })
 }
 
 // ---- pause/resume/restart ----
@@ -512,11 +582,11 @@ onBeforeUnmount(() => {
       <!-- Core settings -->
       <section class="mt-4">
         <h3 class="mb-2 font-semibold text-slate-100">Налаштування</h3>
-        <LabeledNumber v-model.number="ui.aliveCount" label="Кількість кружечків" :min="10" :max="10000000" :step="1" />
-        <LabeledRange v-model.number="ui.ringWidthPx" label="Товщина лінії ХР (px)" :min="1" :max="6" :step="1" />
-        <LabeledRange v-model.number="ui.radiusCss" label="Радіус (px)" :min="2" :max="12" :step="1" />
-        <LabeledRange v-model.number="ui.speedCss" label="Швидкість (px/s)" :min="10" :max="200" :step="1" />
-        <LabeledRange v-model.number="ui.fps" label="FPS" :min="30" :max="120" :step="1" />
+        <labeled-number v-model.number="ui.aliveCount" label="Кількість кружечків" :min="10" :max="10000000" :step="1" />
+        <labeled-range v-model.number="ui.ringWidthPx" label="Товщина лінії ХР (px)" :min="1" :max="6" :step="1" />
+        <labeled-range v-model.number="ui.radiusCss" label="Радіус (px)" :min="2" :max="12" :step="1" />
+        <labeled-range v-model.number="ui.speedCss" label="Швидкість (px/s)" :min="10" :max="200" :step="1" />
+        <labeled-range v-model.number="ui.fps" label="FPS" :min="30" :max="120" :step="1" />
         <div class="gap-3 grid grid-cols-2 mt-3">
           <div>
             <div class="mb-1 text-slate-300 text-sm">Колір точок</div>
@@ -531,11 +601,11 @@ onBeforeUnmount(() => {
       <!-- Labels / avatars -->
       <section class="mt-4 pt-4 border-slate-800 border-t">
         <h3 class="mb-2 font-semibold text-slate-100">Підписи</h3>
-        <LabeledRange v-model.number="ui.labelsCount" label="Кількість підписів" :min="0" :max="2000" :step="1" />
-        <LabeledRange v-model.number="ui.labelsSmoothMs" label="Плавність підписів (мс)" :min="16" :max="600" :step="1" />
-        <LabeledNumber v-model.number="ui.labelsThrottleMs" label="Оновлення позицій (мс)" :min="8" :max="200" :step="1" />
+        <labeled-range v-model.number="ui.labelsCount" label="Кількість підписів" :min="0" :max="2000" :step="1" />
+        <labeled-range v-model.number="ui.labelsSmoothMs" label="Плавність підписів (мс)" :min="16" :max="600" :step="1" />
+        <labeled-number v-model.number="ui.labelsThrottleMs" label="Оновлення позицій (мс)" :min="8" :max="200" :step="1" />
         <div class="gap-3 grid grid-cols-2 mt-3">
-          <LabeledNumber v-model.number="ui.avatarTilePx" label="Розмір тайла аватара" :min="32" :max="128" :step="1" />
+          <labeled-number v-model.number="ui.avatarTilePx" label="Розмір тайла аватара" :min="32" :max="128" :step="1" />
           <label class="inline-flex items-center gap-2">
             <input type="checkbox" v-model="ui.gpuAvatars" class="accent-emerald-500" />
             <span class="text-sm">GPU-аватарки (атлас)</span>
@@ -551,8 +621,8 @@ onBeforeUnmount(() => {
           <input type="checkbox" v-model="ui.autoRadius" class="accent-emerald-500" />
           <span class="text-sm">Вмикати автоматичне збільшення радіуса</span>
         </label>
-        <LabeledRange v-model.number="ui.radiusScaleMax" label="Max scale (×)" :min="1" :max="20" :step="0.1" />
-        <LabeledRange v-model.number="ui.radiusScaleExp" label="Експонента (крива)" :min="0.1" :max="8" :step="0.1" />
+        <labeled-range v-model.number="ui.radiusScaleMax" label="Max scale (×)" :min="1" :max="20" :step="0.1" />
+        <labeled-range v-model.number="ui.radiusScaleExp" label="Експонента (крива)" :min="0.1" :max="8" :step="0.1" />
       </section>
 
       <!-- Collisions -->
@@ -562,28 +632,28 @@ onBeforeUnmount(() => {
           <input type="checkbox" v-model="ui.collisions" class="accent-emerald-500" />
           <span class="text-sm">Увімкнути колізії (апрокс.)</span>
         </label>
-        <LabeledRange v-model.number="ui.cellSizePx" label="Розмір ґріда (px)" :min="8" :max="64" :step="1" />
-        <LabeledRange v-model.number="ui.maxPairsPerCell" label="Ліміт пар/клітинку" :min="32" :max="512" :step="32" />
+        <labeled-range v-model.number="ui.cellSizePx" label="Розмір ґріда (px)" :min="8" :max="64" :step="1" />
+        <labeled-range v-model.number="ui.maxPairsPerCell" label="Ліміт пар/клітинку" :min="32" :max="512" :step="32" />
       </section>
 
       <!-- Speed & boosts -->
       <section class="mt-4 pt-4 border-slate-800 border-t">
         <h3 class="mb-2 font-semibold text-slate-100">Швидкість та буст</h3>
-        <LabeledRange v-model.number="ui.minSpeedCss" label="Мін. швидкість (px/s)" :min="0" :max="300" :step="1" />
-        <LabeledRange v-model.number="ui.maxSpeedCss" label="Макс. швидкість (px/s)" :min="ui.minSpeedCss" :max="800" :step="1" />
+        <labeled-range v-model.number="ui.minSpeedCss" label="Мін. швидкість (px/s)" :min="0" :max="300" :step="1" />
+        <labeled-range v-model.number="ui.maxSpeedCss" label="Макс. швидкість (px/s)" :min="ui.minSpeedCss" :max="800" :step="1" />
         <div class="gap-3 grid grid-cols-2 mt-3">
-          <LabeledRange v-model.number="ui.hitBoostPct" label="Буст при зіткненні (%)" :min="0" :max="100" :step="1" />
-          <LabeledRange v-model.number="ui.wallBoostPct" label="Буст від стіни (%)" :min="0" :max="100" :step="1" />
+          <labeled-range v-model.number="ui.hitBoostPct" label="Буст при зіткненні (%)" :min="0" :max="100" :step="1" />
+          <labeled-range v-model.number="ui.wallBoostPct" label="Буст від стіни (%)" :min="0" :max="100" :step="1" />
         </div>
       </section>
 
       <!-- Health -->
       <section class="mt-4 pt-4 border-slate-800 border-t">
         <h3 class="mb-2 font-semibold text-slate-100">Здоров'я (HP)</h3>
-        <LabeledRange v-model.number="ui.hpMax" label="Max HP" :min="1" :max="2500" :step="1" />
+        <labeled-range v-model.number="ui.hpMax" label="Max HP" :min="1" :max="2500" :step="1" />
         <div class="gap-3 grid grid-cols-2 mt-3">
-          <LabeledRange v-model.number="ui.dmgHitMin" label="DMG min" :min="0" :max="50" :step="1" />
-          <LabeledRange v-model.number="ui.dmgHitMax" label="DMG max" :min="ui.dmgHitMin" :max="50" :step="1" />
+          <labeled-range v-model.number="ui.dmgHitMin" label="DMG min" :min="0" :max="50" :step="1" />
+          <labeled-range v-model.number="ui.dmgHitMax" label="DMG max" :min="ui.dmgHitMin" :max="50" :step="1" />
         </div>
         <button class="bg-rose-600 hover:bg-rose-500 shadow mt-3 px-3 py-2 rounded-lg font-medium text-white text-sm" @click="setAllHP">
           Set HP for all

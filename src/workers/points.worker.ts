@@ -8,6 +8,7 @@ let w = 1, h = 1, dpr = 1
 let maxFps = 60
 let paused = false
 let lastTime = 0
+let lastAlivePulse = 0
 let winnerSent = false
 
 // Simulation state
@@ -296,42 +297,32 @@ async function emptyBitmap(size: number) {
   return await createImageBitmap(oc)
 }
 
-// CORS fallback helpers for avatars
-function proxyImageUrl(url: string, tile: number) {
+async function loadAvatarBitmap(
+  url: string,
+  tile: number,
+): Promise<ImageBitmap> {
   try {
-    const u = new URL(url)
-    const clean = `${u.hostname}${u.pathname}${u.search || ''}`
-    return `https://images.weserv.nl/?url=${encodeURIComponent(clean)}&w=${tile}&h=${tile}&fit=cover&dpr=1`
-  } catch {
-    return url
-  }
-}
-async function loadAvatarBitmap(url: string, tile: number): Promise<ImageBitmap> {
-  try {
-    const r = await fetch(url, { mode: 'cors' })
+    const r = await fetch(url, {
+      mode: 'cors',
+      cache: 'force-cache',
+      credentials: 'omit',
+      referrerPolicy: 'no-referrer',
+    })
     if (!r.ok) throw new Error(`HTTP ${r.status}`)
     const blob = await r.blob()
     const src = await createImageBitmap(blob)
-    const w0 = src.width, h0 = src.height, side = Math.min(w0, h0)
-    const sx = (w0 - side) * 0.5, sy = (h0 - side) * 0.5
-    const bmp = await createImageBitmap(src, sx, sy, side, side, { resizeWidth: tile, resizeHeight: tile, resizeQuality: 'high' } as any)
+
+    const w = src.width, h = src.height, side = Math.min(w, h)
+    const sx = (w - side) * 0.5, sy = (h - side) * 0.5
+    const bmp = await createImageBitmap(src, sx, sy, side, side, {
+      resizeWidth: tile,
+      resizeHeight: tile,
+      resizeQuality: 'high'
+    } as any)
     src.close()
     return bmp
   } catch {
-    try {
-      const prox = proxyImageUrl(url, tile)
-      const r2 = await fetch(prox, { mode: 'cors' })
-      if (!r2.ok) throw new Error(`HTTP ${r2.status}`)
-      const blob2 = await r2.blob()
-      const src2 = await createImageBitmap(blob2)
-      const w1 = src2.width, h1 = src2.height, s1 = Math.min(w1, h1)
-      const sx1 = (w1 - s1) * 0.5, sy1 = (h1 - s1) * 0.5
-      const bmp2 = await createImageBitmap(src2, sx1, sy1, s1, s1, { resizeWidth: tile, resizeHeight: tile, resizeQuality: 'high' } as any)
-      src2.close()
-      return bmp2
-    } catch {
-      return emptyBitmap(tile)
-    }
+    return emptyBitmap(tile)
   }
 }
 
@@ -718,6 +709,11 @@ function loop() {
   step(dt)
   render()
 
+  if (performance.now() - lastAlivePulse >= 300) {
+    (self as any).postMessage({ type: 'alive', aliveCount })
+    lastAlivePulse = performance.now()
+  }
+  
   if (now - lastLabelsSent >= labelsThrottleMs) { sendLabels(); lastLabelsSent = now }
 
   const target = 1000 / Math.max(1, maxFps)
