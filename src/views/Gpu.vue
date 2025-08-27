@@ -584,7 +584,7 @@ onBeforeUnmount(() => {
         <h3 class="mb-2 font-semibold text-slate-100">Налаштування</h3>
         <labeled-number v-model.number="ui.aliveCount" label="Кількість кружечків" :min="10" :max="10000000" :step="1" />
         <labeled-range v-model.number="ui.ringWidthPx" label="Товщина лінії ХР (px)" :min="1" :max="6" :step="1" />
-        <labeled-range v-model.number="ui.radiusCss" label="Радіус (px)" :min="2" :max="12" :step="1" />
+        <labeled-range v-model.number="ui.radiusCss" label="Радіус (px)" :min="2" :max="100" :step="1" />
         <labeled-range v-model.number="ui.speedCss" label="Швидкість (px/s)" :min="10" :max="200" :step="1" />
         <labeled-range v-model.number="ui.fps" label="FPS" :min="30" :max="120" :step="1" />
         <div class="gap-3 grid grid-cols-2 mt-3">
