@@ -56,6 +56,13 @@ function radiusDevice(): number {
   return cfg.radiusCss * s * dpr
 }
 
+let basePath = '/'
+function urlFromBase(p: string) {
+  const b = (basePath || '/').replace(/\/+$/, '')
+  const rel = String(p).replace(/^\/+/, '')
+  return (b ? `${b}/${rel}` : `/${rel}`)
+}
+
 // Labels streaming
 let labelIndices: Int32Array | null = null
 let labelsThrottleMs = 50
@@ -164,17 +171,33 @@ void main() {
 
   vec3 col;
   if (r > inner) {
-    // border uses HP color, softly tinted by uniform ring color
-    vec3 hc = hpColor(clamp(vHP, 0.0, 1.0));
-    col = mix(hc, u_ringColor, 0.15);
+    // --- HP ring as wedge segment ---
+    // angle 0..2π, start at 12 o'clock
+    float ang = atan(p.y, p.x);                 // -π..π (0 at +X)
+    if (ang < 0.0) ang += 6.28318530718;        // 0..2π
+    ang -= 1.57079632679;                       // rotate so 0 at top
+    if (ang < 0.0) ang += 6.28318530718;        // keep 0..2π
+
+    float hpAng = clamp(vHP, 0.0, 1.0) * 6.28318530718;
+
+    if (ang <= hpAng) {
+      // visible wedge = HP left
+      vec3 hc = hpColor(clamp(vHP, 0.0, 1.0));
+      col = mix(hc, u_ringColor, 0.15);
+    } else {
+      // hide the rest of the ring (draw as body color)
+      col = u_color;
+    }
+    // --- end wedge ---
   } else {
     col = u_color;
   }
 
-  float alpha = 0.9; // constant alpha; you can modulate by vHP if desired
+  float alpha = 0.9;
   frag = vec4(col, alpha);
 }
 `;
+
 
 // Avatar shaders
 const VS_AVATAR = `#version 300 es
@@ -256,6 +279,32 @@ function COUNT_BYTES_POS() { return count * 2 * 4 }
 function COUNT_BYTES_HP() { return count * 4 }
 
 // ---------- Avatars pipeline ----------
+// Placeholder bitmap (reused)
+let placeholderBmp: ImageBitmap | null = null
+
+async function getPlaceholderBitmap(tile: number): Promise<ImageBitmap> {
+  if (placeholderBmp && placeholderBmp.width === tile && placeholderBmp.height === tile) return placeholderBmp
+  try {
+    const r = await fetch(urlFromBase('placeholder.jpg'), {
+      mode: 'same-origin', cache: 'force-cache', credentials: 'omit'
+    })
+    if (!r.ok) throw new Error(`ph HTTP ${r.status}`)
+    const blob = await r.blob()
+    const src = await createImageBitmap(blob)
+    const w = src.width, h = src.height, side = Math.min(w, h)
+    const sx = (w - side) * 0.5, sy = (h - side) * 0.5
+    placeholderBmp = await createImageBitmap(src, sx, sy, side, side, {
+      resizeWidth: tile,
+      resizeHeight: tile,
+      resizeQuality: 'high'
+    } as any)
+    src.close()
+    return placeholderBmp!
+  } catch {
+    return emptyBitmap(tile)
+  }
+}
+
 function initAvatarProgram() {
   if (!gl) return
   if (!progAvatar) progAvatar = link(VS_AVATAR, FS_AVATAR)
@@ -297,14 +346,32 @@ async function emptyBitmap(size: number) {
   return await createImageBitmap(oc)
 }
 
-async function loadAvatarBitmap(
-  url: string,
-  tile: number,
-): Promise<ImageBitmap> {
+async function replaceAtlasTile(i: number, cols: number, retry = 0) {
+  if (!gl || !atlasTex) return
+  const entry = avatarEntries[i]
+  if (!entry?.url) return
+  try {
+    const bmp = await loadAvatarBitmap(entry.url, avatarTile)
+    const c = i % cols, r = (i / cols) | 0
+    const x = c * avatarTile, y = r * avatarTile
+
+    gl.bindTexture(gl.TEXTURE_2D, atlasTex!)
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, gl.RGBA, gl.UNSIGNED_BYTE, bmp)
+    bmp.close()
+    gl.generateMipmap(gl.TEXTURE_2D)
+    gl.bindTexture(gl.TEXTURE_2D, null)
+
+    ;(self as any).postMessage({ type: 'avatarTileUpdated', i }) // опційно для дебагу
+  } catch {
+    if (retry < 1) setTimeout(() => replaceAtlasTile(i, cols, retry + 1), 2000)
+  }
+}
+
+async function loadAvatarBitmap(url: string, tile: number): Promise<ImageBitmap> {
   try {
     const r = await fetch(url, {
       mode: 'cors',
-      cache: 'force-cache',
+      cache: 'no-store',
       credentials: 'omit',
       referrerPolicy: 'no-referrer',
     })
@@ -326,23 +393,18 @@ async function loadAvatarBitmap(
   }
 }
 
-async function buildAvatarAtlas() {
+async function buildAvatarAtlas(notify = true) {
   avatarReady = false
   if (!gl) return
+
   if (avatarEntries.length === 0) {
     avatarIndices = null; avatarUVs = null
     if (atlasTex) { gl.deleteTexture(atlasTex); atlasTex = null }
-    ;(self as any).postMessage({ type: 'avatarsReady', tiles: 0, atlasW: 0, atlasH: 0 })
+    if (notify) (self as any).postMessage({ type: 'avatarsReady', tiles: 0, atlasW: 0, atlasH: 0 })
     return
   }
 
-  const bitmaps: ImageBitmap[] = []
-  for (const it of avatarEntries) {
-    const bmp = await loadAvatarBitmap(it.url, avatarTile)
-    bitmaps.push(bmp)
-  }
-
-  const K = bitmaps.length
+  const K = avatarEntries.length
   const cols = Math.ceil(Math.sqrt(K))
   const rows = Math.ceil(K / cols)
   atlasW = cols * avatarTile
@@ -359,12 +421,11 @@ async function buildAvatarAtlas() {
   avatarUVs = new Float32Array(K * 4)
   avatarIndices = new Int32Array(K)
 
+  const ph = await getPlaceholderBitmap(avatarTile)
   for (let i = 0; i < K; i++) {
-    const bmp = bitmaps[i]
     const c = i % cols, r = (i / cols) | 0
     const x = c * avatarTile, y = r * avatarTile
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, gl.RGBA, gl.UNSIGNED_BYTE, bmp)
-    bmp.close()
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, gl.RGBA, gl.UNSIGNED_BYTE, ph)
 
     const u0 = x / atlasW, v0 = y / atlasH
     const u1 = (x + avatarTile) / atlasW, v1 = (y + avatarTile) / atlasH
@@ -376,7 +437,9 @@ async function buildAvatarAtlas() {
 
   initAvatarProgram()
   avatarReady = true
-  ;(self as any).postMessage({ type: 'avatarsReady', tiles: K, atlasW, atlasH })
+  if (notify) (self as any).postMessage({ type: 'avatarsReady', tiles: K, atlasW, atlasH })
+
+  for (let i = 0; i < K; i++) replaceAtlasTile(i, cols)
 }
 
 function renderAvatarsPass() {
@@ -524,7 +587,7 @@ function step(dt: number) {
 
   if (cfg.collisions) {
     // If radius just grew a lot, do two narrow-phase passes to resolve overlaps faster
-    const iterations =  (radiusDevice() > (step as any)._lastR * 1.1) ? 2 : 1;
+    const iterations = (radiusDevice() > (step as any)._lastR * 1.1) ? 2 : 1;
     (step as any)._lastR = radiusDevice();
 
     for (let pass = 0; pass < iterations; pass++) {
@@ -636,7 +699,7 @@ function step(dt: number) {
 
   // winner event
   if (aliveCount === 1 && !winnerSent && lastIdx !== -1) {
-    ;(self as any).postMessage({ type: 'winner', index: lastIdx, hp: hp[lastIdx], x: px[lastIdx], y: py[lastIdx], radiusPx: r })
+    ; (self as any).postMessage({ type: 'winner', index: lastIdx, hp: hp[lastIdx], x: px[lastIdx], y: py[lastIdx], radiusPx: r })
     winnerSent = true
   } else if (aliveCount > 1) {
     winnerSent = false
@@ -713,7 +776,7 @@ function loop() {
     (self as any).postMessage({ type: 'alive', aliveCount })
     lastAlivePulse = performance.now()
   }
-  
+
   if (now - lastLabelsSent >= labelsThrottleMs) { sendLabels(); lastLabelsSent = now }
 
   const target = 1000 / Math.max(1, maxFps)
@@ -726,6 +789,7 @@ self.onmessage = async (e: MessageEvent) => {
   const m: any = e.data
   try {
     if (m.type === 'init') {
+      if (typeof m.base === 'string') basePath = m.base
       canvas = m.canvas as OffscreenCanvas
       w = m.width | 0; h = m.height | 0; dpr = m.dpr || 1
       count = m.count | 0
@@ -735,6 +799,10 @@ self.onmessage = async (e: MessageEvent) => {
       lastTime = performance.now()
       paused = false
       loop()
+      if (avatarEntries.length) {
+        await buildAvatarAtlas(false)
+          ;(self as any).postMessage({ type: 'avatarsReady', tiles: avatarEntries.length, atlasW, atlasH })
+        }
       return
     }
     if (m.type === 'resize') {
@@ -772,11 +840,10 @@ self.onmessage = async (e: MessageEvent) => {
     if (m.type === 'avatarsSet') {
       avatarTile = Math.max(16, (m.tile | 0) || 64)
       avatarEntries = Array.isArray(m.entries) ? m.entries : []
-      await buildAvatarAtlas()
-      ;(self as any).postMessage({ type: 'avatarsReady', tiles: avatarEntries.length, atlasW, atlasH })
+      buildAvatarAtlas()
       return
     }
   } catch (err: any) {
-    ;(self as any).postMessage({ type: 'error', error: String(err?.message || err) })
+    ; (self as any).postMessage({ type: 'error', error: String(err?.message || err) })
   }
 }

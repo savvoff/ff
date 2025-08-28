@@ -7,7 +7,7 @@ import { useLocalStorage } from '@/composables/useLocalStorage'
 import demo from '../demo.json';
 
 const fireworks = defineAsyncComponent(() => import('../components/Fireworks.vue'));
-
+const baseUrl = import.meta.env.BASE_URL;
 const defaultParams = {
   // visuals
   aliveCount: 200,
@@ -353,12 +353,16 @@ async function startFight() {
     const m = e.data as any
     if (m?.type === 'labels') {
       lastRadiusPx = m.radiusPx || lastRadiusPx
-      lastAliveCount.value = typeof m.aliveCount === 'number' ? m.aliveCount : lastAliveCount
+      lastAliveCount.value = (typeof m.aliveCount === 'number') ? m.aliveCount : lastAliveCount.value
       drawLabelsFromWorker(m)
       return
     }
     if (m?.type === 'avatarsReady') {
       console.log('[GPU] avatarsReady:', m.tiles, 'tiles, atlas', m.atlasW, 'x', m.atlasH)
+      return
+    }
+    if (m?.type === 'avatarTileUpdated') {
+      console.debug('Avatar tile updated:', m.i)
       return
     }
     if (m?.type === 'winner') {
@@ -381,7 +385,8 @@ async function startFight() {
     height: c.height,
     dpr,
     count: ui.aliveCount,
-    maxFps: ui.fps
+    maxFps: ui.fps,
+    base: baseUrl
   }, [off])
   offscreenTransferred = true
 
