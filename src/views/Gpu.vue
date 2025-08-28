@@ -359,11 +359,11 @@ async function startFight() {
       return
     }
     if (m?.type === 'avatarsReady') {
-      console.log('[GPU] avatarsReady:', m.tiles, 'tiles, atlas', m.atlasW, 'x', m.atlasH)
+      // console.log('[GPU] avatarsReady:', m.tiles, 'tiles, atlas', m.atlasW, 'x', m.atlasH)
       return
     }
     if (m?.type === 'avatarTileUpdated') {
-      console.debug('Avatar tile updated:', m.i)
+      // console.debug('Avatar tile updated:', m.i)
       return
     }
     if (m?.type === 'winner') {
@@ -372,7 +372,7 @@ async function startFight() {
       return
     }
     if (m?.type === 'error') {
-      console.error('Worker error:', m.error)
+      // console.error('Worker error:', m.error)
       return
     }
   }
