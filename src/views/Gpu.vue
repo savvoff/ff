@@ -1,10 +1,12 @@
 <script setup lang="ts">
 // All comments in this code are in English only.
-import { ref, reactive, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, reactive, onMounted, onBeforeUnmount, watch, defineAsyncComponent } from 'vue'
 import LabeledRange from '@/components/LabeledRange.vue'
 import LabeledNumber from '@/components/LabeledNumber.vue'
 import { useLocalStorage } from '@/composables/useLocalStorage'
 import demo from '../demo.json';
+
+const fireworks = defineAsyncComponent(() => import('../components/Fireworks.vue'));
 
 const defaultParams = {
   // visuals
@@ -475,7 +477,7 @@ onBeforeUnmount(() => {
     <!-- Stage -->
     <div ref="stageRef" class="relative rounded-xl ring-1 ring-slate-800 h-full overflow-hidden">
       <!-- WebGL / Offscreen target -->
-      <canvas ref="pointsRef" class="block bg-transparent w-full h-full"></canvas>
+      <canvas ref="pointsRef" class="block bg-transparent w-full h-full"></canvas>      
       <!-- 2D overlay for labels (names only; avatars are on GPU) -->
       <canvas ref="labelsRef" class="z-10 absolute inset-0 pointer-events-none"></canvas>
 
@@ -508,28 +510,22 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- Winner modal -->
-      <div v-if="winner" class="z-20 absolute inset-0 flex justify-center items-center">
+      <div v-if="winner && !boot.counting" class="z-20 absolute inset-0 flex justify-center items-center">
         <div class="absolute inset-0 bg-black/60"></div>
-        <div class="z-10 relative bg-slate-900/95 shadow-2xl p-6 border border-slate-700 rounded-2xl max-w-sm text-center">
-          <div class="font-extrabold text-white text-3xl">Winner</div>
+        <div class="z-10 relative bg-slate-900/95 shadow-2xl p-6 border border-slate-700 rounded-2xl w-1/3 min-w-60 text-center">
+          <div class="font-extrabold text-white text-5xl lg:text-6xl">Winner</div>
 
-          <div v-if="winner.avatarUrl" class="mx-auto mt-4 rounded-full ring-4 ring-emerald-400/70 w-24 h-24 overflow-hidden">
+          <div v-if="winner.avatarUrl" class="mx-auto mt-4 rounded-full ring-4 ring-emerald-400/70 w-32 lg:w-40 h-32 lg:h-40 overflow-hidden">
             <img :src="winner.avatarUrl" crossorigin="anonymous" class="w-full h-full object-cover" />
           </div>
 
-          <div class="mt-3 font-semibold text-slate-100 text-xl">{{ winner.name }}</div>
-          <div class="mt-1 text-slate-400 text-sm">HP: {{ Math.round(winner.hp) }}</div>
-
-          <div class="flex justify-center gap-2 mt-5">
-            <button class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-lg font-medium text-white" @click="restartFight">
-              Start new fight
-            </button>
-            <button class="bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded-lg text-white" @click="winner = null">
-              Close
-            </button>
-          </div>
+          <div class="mt-3 font-semibold text-slate-100 text-3xl">{{ winner.name }}</div>
+          <div class="mt-1 text-slate-400 text-lg">HP: {{ Math.round(winner.hp) }}</div>
         </div>
       </div>
+
+      <!-- Fireworks -->
+      <component v-if="winner && !boot.counting" class="top-0 left-0 z-20 absolute pointer-events-none" :is="fireworks" />
 
       <!-- Mobile controls -->
       <div class="lg:hidden bottom-3 left-3 z-10 absolute flex gap-2">
