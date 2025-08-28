@@ -37,4 +37,7 @@ onMounted(() => {
   input[type="number"] { -moz-appearance: textfield; }
   input[type="number"]::-webkit-outer-spin-button,
   input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  .text-shadow {
+    text-shadow: 0px 1px 3px rgb(0 0 0 / 0.8);
+  }
 </style>

@@ -64,7 +64,7 @@ let labelSlots: LabelSlot[] = []
 let rafId: number | null = null
 let lastRAF = performance.now()
 let lastRadiusPx = 8
-let lastAliveCount = ui.aliveCount
+const lastAliveCount = ref(ui.aliveCount)
 
 const boot = reactive({ started: false, counting: false, counter: 0 })
 
@@ -346,7 +346,7 @@ async function startFight() {
     const m = e.data as any
     if (m?.type === 'labels') {
       lastRadiusPx = m.radiusPx || lastRadiusPx
-      lastAliveCount = typeof m.aliveCount === 'number' ? m.aliveCount : lastAliveCount
+      lastAliveCount.value = typeof m.aliveCount === 'number' ? m.aliveCount : lastAliveCount
       drawLabelsFromWorker(m)
       return
     }
@@ -477,10 +477,15 @@ onBeforeUnmount(() => {
     <!-- Stage -->
     <div ref="stageRef" class="relative rounded-xl ring-1 ring-slate-800 h-full overflow-hidden">
       <!-- WebGL / Offscreen target -->
-      <canvas ref="pointsRef" class="block bg-transparent w-full h-full"></canvas>      
+      <canvas ref="pointsRef" class="block bg-transparent w-full h-full"></canvas>
       <!-- 2D overlay for labels (names only; avatars are on GPU) -->
       <canvas ref="labelsRef" class="z-10 absolute inset-0 pointer-events-none"></canvas>
-
+      <!-- Alive counter -->
+      <div class="top-0 left-0 absolute">
+        <p class="text-shadow p-2 text-white text-lg uppercase">
+          Alive: <span class="tabular-nums">{{ lastAliveCount }}</span>
+        </p>
+      </div>
       <!-- Start overlay -->
       <div v-if="!boot.started" class="z-20 absolute inset-0 flex justify-center items-center">
         <div class="absolute inset-0 bg-black/60"></div>
@@ -571,7 +576,6 @@ onBeforeUnmount(() => {
             <input type="file" accept=".json,.txt,.csv" class="hidden" @change="onFile" />
             Upload file
           </label>
-          <button class="bg-slate-700 hover:bg-slate-600 px-2 py-1 rounded" @click="parseUsersJSON">Apply</button>
         </div>
       </section>
 
