@@ -171,38 +171,39 @@ function setAllHP() {
 
 // ---- labels (names only) ----
 function buildLabelIndices() {
-  const K = Math.max(0, users.value.length)
-  if (K === 0) {
+  const alive = Math.max(1, ui.aliveCount | 0)
+  const totalUsers = Array.isArray(users.value) ? (users.value.length | 0) : 0
+
+  if (totalUsers === 0) {
     labelSlots = []
     if (worker) worker.postMessage({ type: 'labelsConfig', indices: [], throttleMs: ui.labelsThrottleMs, sendOnce: true })
     clearLabels()
     return
   }
 
-  // build K unique indices in [0..aliveCount)
+  // We cannot have more unique labels than particles.
+  const K = Math.min(totalUsers, alive)
   const indices = new Int32Array(K)
-  const taken = new Set<number>()
-  const step = Math.max(1, Math.floor(ui.aliveCount / K))
 
-  for (let i = 0; i < K; i++) {
-    const base = Math.floor((i + 0.5) * step)
-    const jitter = Math.floor((Math.random() - 0.5) * step * 0.5)
-    let idx = Math.min(ui.aliveCount - 1, Math.max(0, (base + jitter) | 0))
-
-    // ensure uniqueness
-    let tries = 0
-    while (taken.has(idx) && tries++ < 8) idx = (idx + 1) % ui.aliveCount
-    if (taken.has(idx)) {
-      let r = (Math.random() * ui.aliveCount) | 0
-      while (taken.has(r)) r = (r + 1) % ui.aliveCount
-      idx = r
+  if (K === alive) {
+    // simple 0..alive-1
+    for (let i = 0; i < K; i++) indices[i] = i
+  } else {
+    // stratified unique pick across [0..alive)
+    const step = alive / K
+    const taken = new Set<number>()
+    let cur = 0
+    for (let i = 0; i < K; i++) {
+      let idx = Math.min(alive - 1, Math.floor(cur))
+      // ensure uniqueness by bumping to next free slot
+      while (taken.has(idx)) idx = (idx + 1) % alive
+      taken.add(idx)
+      indices[i] = idx
+      cur += step
     }
-
-    taken.add(idx)
-    indices[i] = idx
   }
 
-  // names must match selected particle indices
+  // labels are tied to particle indices; names map via nameForIndex(id)
   labelSlots = Array.from(indices, (id) => ({
     id,
     name: nameForIndex(id),
@@ -564,7 +565,7 @@ onBeforeUnmount(() => {
 
     <!-- Side panel -->
     <aside class="hidden lg:block bg-slate-900/90 p-4 border border-slate-800 rounded-xl h-screen overflow-auto text-slate-200">
-      <section class="flex items-center gap-2 mb-4">
+      <section class="hidden flex items-center gap-2 mb-4">
         <label class="inline-flex items-center gap-2">
           <input type="checkbox" v-model="ui.autoTune" class="accent-emerald-500" />
           <span class="text-sm">Авто-підлаштування</span>
