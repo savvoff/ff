@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // All comments in this code are in English only.
-import { ref, reactive, onMounted, onBeforeUnmount, watch, defineAsyncComponent } from 'vue'
+import { ref, reactive, onMounted, onBeforeUnmount, watch, defineAsyncComponent, computed } from 'vue'
 import LabeledRange from '@/components/LabeledRange.vue'
 import LabeledNumber from '@/components/LabeledNumber.vue'
 import { useLocalStorage } from '@/composables/useLocalStorage'
@@ -33,8 +33,8 @@ const defaultParams = {
   cellSizePx: 24,
   maxPairsPerCell: 128,
   // labels
-  labelsCount: 64,
   labelsSmoothMs: 150,
+  labelThreshold: 20,
   labelsThrottleMs: 50,
   // fps
   fps: 60,
@@ -46,9 +46,15 @@ const defaultParams = {
   avatarTilePx: 64,
 }
 
+const currentAlive = computed(() => {
+  const v = Number(lastAliveCount.value)
+  return Number.isFinite(v) && v > 0 ? v : ui.aliveCount
+})
+
+const showLabelsCanvas = computed(() => currentAlive.value <= ui.labelThreshold)
 
 // Load from localStorage (if exists), else use defaults
-const saved = useLocalStorage('params-gpu', defaultParams)
+const saved = useLocalStorage('gpu.ui', defaultParams)
 const ui = saved.value ?? reactive(defaultParams)
 
 const stageRef = ref<HTMLDivElement | null>(null)
@@ -165,7 +171,7 @@ function setAllHP() {
 
 // ---- labels (names only) ----
 function buildLabelIndices() {
-  const K = Math.max(0, Math.min(ui.labelsCount, users.value.length))
+  const K = Math.max(0, users.value.length)
   if (K === 0) {
     labelSlots = []
     if (worker) worker.postMessage({ type: 'labelsConfig', indices: [], throttleMs: ui.labelsThrottleMs, sendOnce: true })
@@ -287,6 +293,7 @@ function renderLabelsRAF() {
 function applyCountChange(n: number) {
   const N = Math.max(1, n | 0);
   ui.aliveCount = N;
+  lastAliveCount.value = N  
   if (worker && boot.started) {
     worker.postMessage({ type: 'setCount', count: N });
     // labels & GPU avatars depend on indices range -> rebuild
@@ -420,12 +427,12 @@ function autoTuneNow() {
   const N = Math.max(nUsers, ui.aliveCount)
   const L = (want: number) => clampNum(want, 0, nUsers)
   let preset: Partial<typeof ui> = {}
-  if (N <= 1000) preset = { collisions: true, cellSizePx: 24, maxPairsPerCell: 512, labelsCount: L(200), labelsThrottleMs: 30, labelsSmoothMs: 120, radiusCss: 7, speedCss: 80, minSpeedCss: 20, maxSpeedCss: 200 }
-  else if (N <= 10000) preset = { collisions: true, cellSizePx: 28, maxPairsPerCell: 256, labelsCount: L(128), labelsThrottleMs: 40, labelsSmoothMs: 140, radiusCss: 6, speedCss: 80, minSpeedCss: 20, maxSpeedCss: 180 }
-  else if (N <= 50000) preset = { collisions: true, cellSizePx: 32, maxPairsPerCell: 128, labelsCount: L(96), labelsThrottleMs: 45, labelsSmoothMs: 150, radiusCss: 6, speedCss: 80, minSpeedCss: 20, maxSpeedCss: 160 }
-  else if (N <= 100000) preset = { collisions: false, labelsCount: L(72), labelsThrottleMs: 50, labelsSmoothMs: 160, radiusCss: 6, speedCss: 80, minSpeedCss: 18, maxSpeedCss: 150 }
-  else if (N <= 300000) preset = { collisions: false, labelsCount: L(56), labelsThrottleMs: 60, labelsSmoothMs: 170, radiusCss: 5, speedCss: 75, minSpeedCss: 16, maxSpeedCss: 140 }
-  else preset = { collisions: false, labelsCount: L(32), labelsThrottleMs: 70, labelsSmoothMs: 180, radiusCss: 5, speedCss: 70, minSpeedCss: 14, maxSpeedCss: 130 }
+  if (N <= 1000) preset = { collisions: true, cellSizePx: 24, maxPairsPerCell: 512, labelsThrottleMs: 30, labelsSmoothMs: 120, radiusCss: 7, speedCss: 80, minSpeedCss: 20, maxSpeedCss: 200 }
+  else if (N <= 10000) preset = { collisions: true, cellSizePx: 28, maxPairsPerCell: 256,labelsThrottleMs: 40, labelsSmoothMs: 140, radiusCss: 6, speedCss: 80, minSpeedCss: 20, maxSpeedCss: 180 }
+  else if (N <= 50000) preset = { collisions: true, cellSizePx: 32, maxPairsPerCell: 128, labelsThrottleMs: 45, labelsSmoothMs: 150, radiusCss: 6, speedCss: 80, minSpeedCss: 20, maxSpeedCss: 160 }
+  else if (N <= 100000) preset = { collisions: false, labelsThrottleMs: 50, labelsSmoothMs: 160, radiusCss: 6, speedCss: 80, minSpeedCss: 18, maxSpeedCss: 150 }
+  else if (N <= 300000) preset = { collisions: false, labelsThrottleMs: 60, labelsSmoothMs: 170, radiusCss: 5, speedCss: 75, minSpeedCss: 16, maxSpeedCss: 140 }
+  else preset = { collisions: false, labelsThrottleMs: 70, labelsSmoothMs: 180, radiusCss: 5, speedCss: 70, minSpeedCss: 14, maxSpeedCss: 130 }
   Object.assign(ui, preset)
   buildLabelIndices()
   pushConfig()
@@ -459,8 +466,7 @@ onMounted(() => {
   watch(() => ui.maxSpeedCss, v => { if (v < ui.minSpeedCss) ui.minSpeedCss = v })
   watch(usersJson, parseUsersJSON)
   watch(() => ui.aliveCount, v => applyCountChange(v));
-  watch(users, () => { if (ui.autoTune) autoTuneNow(); buildLabelIndices(); }, { deep: true })
-  watch(() => ui.labelsCount, buildLabelIndices)
+  watch(() => users.value.length, () => { if (ui.autoTune) autoTuneNow(); buildLabelIndices() })
   watch(() => [ui.gpuAvatars, ui.avatarTilePx], () => sendGpuAvatarsList())
 })
 onBeforeUnmount(() => {
@@ -479,7 +485,7 @@ onBeforeUnmount(() => {
       <!-- WebGL / Offscreen target -->
       <canvas ref="pointsRef" class="block bg-transparent w-full h-full"></canvas>
       <!-- 2D overlay for labels (names only; avatars are on GPU) -->
-      <canvas ref="labelsRef" class="z-10 absolute inset-0 pointer-events-none"></canvas>
+      <canvas v-show="showLabelsCanvas" ref="labelsRef" class="z-10 absolute inset-0 pointer-events-none"></canvas>
       <!-- Alive counter -->
       <div class="top-0 left-0 absolute">
         <p class="text-shadow p-2 text-white text-lg uppercase">
@@ -525,7 +531,7 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="mt-3 font-semibold text-slate-100 text-3xl">{{ winner.name }}</div>
-          <div class="mt-1 text-slate-400 text-lg">HP: {{ Math.round(winner.hp) }}</div>
+          <div class="mt-1 text-slate-400 text-lg">HP: {{ Math.ceil(winner.hp) }}</div>
         </div>
       </div>
 
@@ -583,6 +589,7 @@ onBeforeUnmount(() => {
       <section class="mt-4">
         <h3 class="mb-2 font-semibold text-slate-100">Налаштування</h3>
         <labeled-number v-model.number="ui.aliveCount" label="Кількість кружечків" :min="10" :max="10000000" :step="1" />
+        <labeled-range v-model.number="ui.labelThreshold" label="Показувати підписи, коли меньше" :min="10" :max="1000" :step="10" />
         <labeled-range v-model.number="ui.ringWidthPx" label="Товщина лінії ХР (px)" :min="1" :max="6" :step="1" />
         <labeled-range v-model.number="ui.radiusCss" label="Радіус (px)" :min="2" :max="100" :step="1" />
         <labeled-range v-model.number="ui.speedCss" label="Швидкість (px/s)" :min="10" :max="200" :step="1" />
@@ -601,7 +608,6 @@ onBeforeUnmount(() => {
       <!-- Labels / avatars -->
       <section class="mt-4 pt-4 border-slate-800 border-t">
         <h3 class="mb-2 font-semibold text-slate-100">Підписи</h3>
-        <labeled-range v-model.number="ui.labelsCount" label="Кількість підписів" :min="0" :max="2000" :step="1" />
         <labeled-range v-model.number="ui.labelsSmoothMs" label="Плавність підписів (мс)" :min="16" :max="600" :step="1" />
         <labeled-number v-model.number="ui.labelsThrottleMs" label="Оновлення позицій (мс)" :min="8" :max="200" :step="1" />
         <div class="gap-3 grid grid-cols-2 mt-3">
