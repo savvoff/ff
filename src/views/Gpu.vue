@@ -493,7 +493,7 @@ onBeforeUnmount(() => {
       <!-- 2D overlay for labels (names only; avatars are on GPU) -->
       <canvas v-show="showLabelsCanvas" ref="labelsRef" class="z-10 absolute inset-0 pointer-events-none"></canvas>
       <!-- Alive counter -->
-      <div class="top-0 left-0 absolute">
+      <div class="top-0 left-0 absolute w-full text-center">
         <p class="text-shadow p-2 text-white text-lg uppercase">
           Alive: <span class="tabular-nums">{{ lastAliveCount }}</span>
         </p>
